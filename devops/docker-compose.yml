@@ -1,0 +1,24 @@
+services:
+  sharepoint-connector:
+    build:
+      context: ..
+      dockerfile: devops/Dockerfile
+    image: sharepoint-connector:latest
+    container_name: sp-connector
+    restart: unless-stopped
+    ports:
+      - "${SP_PORT:-8003}:8003"
+
+    environment:
+      - TENANT_ID=${TENANT_ID}
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+      - SITE_URL=${SITE_URL}
+      - DEFAULT_LIST_NAME=${DEFAULT_LIST_NAME:-}
+      - DEFAULT_DRIVE_NAME=${DEFAULT_DRIVE_NAME:-Documents}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
