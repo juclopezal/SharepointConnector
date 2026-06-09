@@ -1,91 +1,47 @@
 # Arquitectura: SharePoint Connector
 
-**Versión:** 1.0.0  
-**Fecha:** 2026-05-19  
+**Versión:** 2.0.0  
+**Fecha:** 2026-06-09  
 **Autor:** Juan Camilo López Alzate — Latinia  
 
 ---
 
 ## 1. Contexto y motivación
 
-La integración actual entre **Jirito Newsletter** y **SharePoint** se realiza a través de **Power Automate**, un orquestador de alto nivel de Microsoft que actúa como intermediario entre la aplicación y la API de SharePoint.
+La integración original entre **Jirito Newsletter** y **SharePoint** se realizaba a través de **Power Automate**, con dos limitaciones principales:
 
-Esta aproximación presenta limitaciones operativas documentadas:
+- Errores transitorios (408, 429, 5xx) no visibles en los logs, sin trazabilidad de fallos.
+- Lógica de negocio fragmentada entre código y flujos visuales en plataforma externa.
 
-- El conector `Move File` no expone en el log del flujo los errores transitorios (408, 429, 5xx), impidiendo la trazabilidad de fallos.
-- Los reintentos automáticos de Power Automate ocurren de forma opaca, sin visibilidad ni control por parte del equipo de desarrollo.
-- La lógica de negocio queda fragmentada entre el código de la aplicación y flujos visuales en una plataforma externa.
-- Cualquier cambio en el comportamiento del flujo requiere acceso y conocimiento de Power Automate, añadiendo una dependencia de plataforma innecesaria.
-
-**SharePoint Connector** elimina esta dependencia implementando la integración directamente sobre la **Microsoft Graph API**, con control total sobre el ciclo de vida de cada operación.
+**SharePoint Connector** elimina esta dependencia implementando la integración directamente sobre la **Microsoft Graph API**. La versión 2.0.0 amplía el alcance del servicio: en lugar de estar acoplado a un site concreto, expone una API genérica que opera sobre cualquier site, lista y biblioteca de documentos identificados dinámicamente en cada llamada.
 
 ---
 
-## 2. Arquitectura actual (con Power Automate)
+## 2. Arquitectura actual
 
 ```mermaid
 graph LR
-    subgraph Jirito["Jirito Newsletter (Docker)"]
-        AS[AnalysisService]
-        WS[WebhookService]
-        SPS[SharePointService]
-    end
-
-    subgraph PA["Power Automate (Microsoft Cloud)"]
-        F1[Flujo: Upload File]
-        F2[Flujo: Create List Item]
-        F3[Flujo: Move File]
-    end
-
-    subgraph SP["SharePoint"]
-        DL[(Biblioteca\nDocumentos)]
-        LST[(Lista)]
-    end
-
-    AS --> WS
-    AS --> SPS
-    WS -->|"POST webhook\n(json plano)"| F2
-    SPS -->|"POST webhook\n(base64)"| F1
-    F1 --> DL
-    F2 --> LST
-    F1 -->|Move| F3
-    F3 --> DL
-```
-
-### Problemas observados
-
-| Problema | Impacto |
-|---|---|
-| Errores 408/429/5xx no visibles en logs de PA | Sin trazabilidad de fallos |
-| Reintentos opacos del conector `Move File` | Archivos no movidos sin diagnóstico posible |
-| Dependencia de plataforma externa (PA) | Bloqueo operativo ante cambios o incidencias en PA |
-| Lógica de negocio distribuida | Mayor coste de mantenimiento |
-
----
-
-## 3. Arquitectura propuesta
-
-```mermaid
-graph LR
-    subgraph Jirito["Jirito Newsletter (Docker)"]
-        AS[AnalysisService]
-        WS[WebhookService]
-        SPS[SharePointService]
+    subgraph Caller["Caller (cualquier sistema)"]
+        C[HTTP Client]
     end
 
     subgraph SPC["sharepoint-connector (Docker)"]
-        API[FastAPI\nREST API]
-        AUTH[TokenManager\nOAuth2 Cache]
-        SRV[SharePointService\nGraph API]
+        MW[Middleware\nRequest ID · X-App-ID]
+        API["API Layer\n/v1/graph/..."]
+        DEP[Dependencies\nlru_cache singletons]
+        SRV[SharePointService\nGraph API client]
+        AUTH[TokenManager\nOAuth2 cache]
+        CFG[Settings\npydantic-settings]
     end
 
     subgraph AAD["Azure AD"]
         TK[Token Endpoint\nclient_credentials]
     end
 
-    subgraph GRAPH["Microsoft Graph API"]
-        GF[/sites/{id}/drives\nUpload file]
-        GL[/sites/{id}/lists\nCreate item]
+    subgraph GRAPH["Microsoft Graph API v1.0"]
+        GS[/sites — Discovery]
+        GL[/sites/{id}/lists — List Items]
+        GF[/sites/{id}/drives — Files]
     end
 
     subgraph SP["SharePoint"]
@@ -93,164 +49,305 @@ graph LR
         LST[(Lista)]
     end
 
-    AS --> WS
-    AS --> SPS
-    WS -->|"POST /list\n{fields: {...}}"| API
-    SPS -->|"POST /upload\n{folder, filename, data}"| API
-    API --> AUTH
-    AUTH -->|client_id\nclient_secret\ntenant_id| TK
+    C -->|HTTP + X-App-ID| MW
+    MW --> API
+    API --> DEP
+    DEP --> SRV
+    DEP --> AUTH
+    AUTH -->|client_credentials| TK
     TK -->|Bearer token| AUTH
-    AUTH --> SRV
-    SRV --> GF
+    SRV --> GS
     SRV --> GL
-    GF --> DL
+    SRV --> GF
+    GS --> SP
     GL --> LST
+    GF --> DL
+    CFG --> AUTH
+    CFG --> SRV
 ```
-
-### Principios de diseño
-
-1. **Módulo independiente** — el contenedor no pertenece a Jirito ni a ninguna aplicación concreta. Cualquier sistema puede invocarlo.
-2. **Interfaz compatible** — los payloads son iguales o superconjunto de los que actualmente recibe Power Automate, minimizando el cambio en los callers.
-3. **Genérico por diseño** — el endpoint `/list` acepta cualquier combinación de campos y tipos sin esquema fijo, adaptándose a cualquier lista de SharePoint.
-4. **Trazabilidad total** — cada operación queda registrada con su código HTTP, payload y respuesta. Los errores de Graph API son visibles y propagados con detalle.
 
 ---
 
-## 4. Componentes internos
+## 3. Componentes internos
 
 ```mermaid
 graph TD
-    subgraph API Layer
-        UP["POST /upload"]
-        LST["POST /list"]
-        HLT["GET /health"]
+    subgraph "app/api/v1/endpoints"
+        EP_DISC["discovery.py\nGET /sites\nGET /sites/{id}/lists\nGET /sites/{id}/drives\nGET /sites/{id}/drives/{id}/items"]
+        EP_LIST["list_items.py\nGET  /sites/{id}/lists/{id}/items\nPOST /sites/{id}/lists/{id}/items"]
+        EP_FILE["files.py\nPOST /sites/{id}/drives/{id}/files\nGET  /sites/{id}/drives/{id}/items/{id}\nGET  /sites/{id}/drives/{id}/items/{id}/download"]
     end
 
-    subgraph Service Layer
-        SRV[SharePointService]
-        AUTH[TokenManager]
+    subgraph "app/core"
+        AUTH["auth.py\nTokenManager"]
+        CFG["config.py\nSettings"]
+        CTX["context.py\nContextVars"]
+        DEP["dependencies.py\nget_sp()"]
+        EXC["exceptions.py\nGraphAPIError"]
+        LOG["logging.py\nJSONFormatter"]
     end
 
-    subgraph Config
-        CFG[Settings\npydantic-settings]
-        ENV[".env / env vars"]
+    subgraph "app/schemas"
+        SCH_D["discovery.py"]
+        SCH_F["files.py"]
+        SCH_L["list_items.py"]
     end
 
-    UP --> SRV
-    LST --> SRV
-    SRV --> AUTH
-    AUTH -->|"token cache\n(renovación automática)"| AUTH
-    CFG --> SRV
-    CFG --> AUTH
-    ENV --> CFG
+    subgraph "app/services"
+        SRV["sharepoint.py\nSharePointService"]
+    end
+
+    EP_DISC & EP_LIST & EP_FILE --> DEP
+    EP_DISC --> SCH_D
+    EP_FILE --> SCH_F
+    EP_LIST --> SCH_L
+    DEP --> SRV
+    DEP --> AUTH
+    SRV --> CTX
+    SRV --> EXC
+    AUTH --> CFG
+    SRV --> CFG
 ```
 
 ### Descripción de módulos
 
 | Módulo | Archivo | Responsabilidad |
 |---|---|---|
-| **FastAPI app** | `app/main.py` | Punto de entrada, routing, logging |
-| **Config** | `app/config.py` | Variables de entorno con validación Pydantic |
-| **TokenManager** | `app/auth.py` | Obtención y caché del token OAuth2 |
-| **SharePointService** | `app/services/sharepoint.py` | Llamadas a Graph API (upload, list item) |
-| **Models** | `app/models.py` | Esquemas de entrada Pydantic |
-| **Dependencies** | `app/dependencies.py` | Singletons inyectables (FastAPI DI) |
-| **Router /upload** | `app/routers/upload.py` | Endpoint de subida de archivos |
-| **Router /list** | `app/routers/list_item.py` | Endpoint de creación de ítems en lista |
+| **FastAPI app** | `app/main.py` | Punto de entrada, middleware de logging, exception handlers |
+| **Config** | `app/core/config.py` | Variables de entorno validadas con pydantic-settings |
+| **TokenManager** | `app/core/auth.py` | Obtención y caché del token OAuth2 (client_credentials) |
+| **Dependencies** | `app/core/dependencies.py` | Singletons inyectables via `lru_cache` (FastAPI DI) |
+| **Exceptions** | `app/core/exceptions.py` | `GraphAPIError` y handlers de error para FastAPI |
+| **Logging** | `app/core/logging.py` | `JSONFormatter` para logs estructurados en JSON |
+| **Context** | `app/core/context.py` | `ContextVar`s para `request_id` y `client_app_id` |
+| **Router v1** | `app/api/v1/router.py` | Agrupador de endpoints bajo prefijo `/v1` |
+| **Discovery** | `app/api/v1/endpoints/discovery.py` | Endpoints de exploración (sites, listas, drives, carpetas) |
+| **List Items** | `app/api/v1/endpoints/list_items.py` | Lectura y creación de ítems en listas |
+| **Files** | `app/api/v1/endpoints/files.py` | Subida, metadata y descarga de archivos |
+| **Schemas** | `app/schemas/` | Modelos Pydantic de request/response por dominio |
+| **SharePointService** | `app/services/sharepoint.py` | Cliente HTTP de Graph API (GET, POST, PUT, descarga) |
 
 ---
 
-## 5. API
+## 4. API
 
-### `POST /upload`
+Todos los endpoints están bajo el prefijo `/v1/graph`.
 
-Sube un archivo a una biblioteca de documentos de SharePoint.
+### Discovery
 
-**Request:**
-```json
-{
-  "folder": "DailyDelivery/Old",
-  "filename": "LATSUP-5734_20260511.json",
-  "data": "<contenido en Base64>",
-  "drive_name": "Documents"
-}
-```
+#### `GET /v1/graph/sites`
 
-| Campo | Tipo | Requerido | Descripción |
+Lista todos los sites de SharePoint accesibles por la aplicación.
+
+| Query param | Tipo | Default | Descripción |
 |---|---|---|---|
-| `folder` | string | Sí | Ruta relativa dentro de la biblioteca |
-| `filename` | string | Sí | Nombre del archivo destino |
-| `data` | string | Sí | Contenido del archivo en Base64 |
-| `drive_name` | string | No | Biblioteca de documentos (default: `DEFAULT_DRIVE_NAME`) |
-| `token` | string | No | Ignorado — compatibilidad con callers de PA |
+| `search` | string | `*` | Palabra clave para filtrar por nombre o URL |
 
 **Response 200:**
 ```json
 {
-  "status": "ok",
-  "id": "01ABC...",
-  "name": "LATSUP-5734_20260511.json",
-  "webUrl": "https://latinia.sharepoint.com/sites/..."
+  "sites": [
+    { "id": "hostname,site-col-id,site-id", "name": "soporte", "displayName": "Soporte", "webUrl": "https://..." }
+  ],
+  "total": 1
 }
 ```
 
 ---
 
-### `POST /list`
+#### `GET /v1/graph/sites/{site_id}/lists`
 
-Crea un ítem en una lista de SharePoint. Acepta cualquier combinación de campos y tipos de dato.
+Lista todas las listas del site (incluidas listas de sistema).
+
+**Response 200:**
+```json
+{
+  "site_id": "...",
+  "lists": [
+    { "id": "uuid", "name": "Análisis Soporte", "displayName": "Análisis Soporte", "webUrl": "https://..." }
+  ],
+  "total": 1
+}
+```
+
+---
+
+#### `GET /v1/graph/sites/{site_id}/drives`
+
+Lista las bibliotecas de documentos (drives) del site.
+
+**Response 200:**
+```json
+{
+  "site_id": "...",
+  "drives": [
+    { "id": "b!...", "name": "Documents", "driveType": "documentLibrary", "webUrl": "https://..." }
+  ],
+  "total": 1
+}
+```
+
+---
+
+#### `GET /v1/graph/sites/{site_id}/drives/{drive_id}/items`
+
+Navega el árbol de carpetas y archivos de un drive.
+
+| Query param | Tipo | Default | Descripción |
+|---|---|---|---|
+| `item_id` | string | null | ID de carpeta a listar. Omitir para listar la raíz |
+
+**Response 200:**
+```json
+{
+  "drive_id": "b!...",
+  "parent_id": null,
+  "items": [
+    { "id": "...", "name": "DailyDelivery", "is_folder": true, "size": null, "webUrl": "..." }
+  ],
+  "total": 1
+}
+```
+
+---
+
+### List Items
+
+#### `GET /v1/graph/sites/{site_id}/lists/{list_id}/items`
+
+Lee ítems de una lista junto con sus valores de campo.
+
+| Query param | Tipo | Default | Descripción |
+|---|---|---|---|
+| `top` | int | `20` | Número máximo de ítems a devolver (1–5000) |
+
+**Response 200:**
+```json
+{
+  "site_id": "...",
+  "list_id": "...",
+  "items": [
+    { "id": "1", "fields": { "Title": "LATSUP-001", "organization": "Acme" }, "webUrl": "..." }
+  ],
+  "total": 1
+}
+```
+
+---
+
+#### `POST /v1/graph/sites/{site_id}/lists/{list_id}/items`
+
+Inserta un nuevo ítem en la lista.
 
 **Request:**
 ```json
 {
-  "list_name": "Análisis Soporte",
   "fields": {
     "Title": "LATSUP-6585",
     "organization": "Acme Corp",
-    "value_analysis_cliente": "8",
     "score": 9.5,
-    "resolved": true,
-    "tags": ["soporte", "crítico"]
+    "resolved": true
   }
 }
 ```
 
-| Campo | Tipo | Requerido | Descripción |
-|---|---|---|---|
-| `list_name` | string | No | Nombre de la lista SP (default: `DEFAULT_LIST_NAME`) |
-| `fields` | `dict[str, Any]` | Sí | Campos del ítem. Acepta `str`, `int`, `float`, `bool`, `list` |
-| `token` | string | No | Ignorado — compatibilidad con callers de PA |
-
 > Los nombres de campo deben ser los **nombres internos** (internal name) de las columnas en SharePoint, no el nombre de visualización.
 
-**Response 200:**
+**Response 201:**
+```json
+{ "status": "created", "id": "42", "webUrl": "https://..." }
+```
+
+---
+
+### Files
+
+#### `POST /v1/graph/sites/{site_id}/drives/{drive_id}/files`
+
+Sube un archivo a una biblioteca de documentos. El cuerpo es `multipart/form-data`.
+
+| Query param | Tipo | Default | Descripción |
+|---|---|---|---|
+| `folder` | string | `""` | Subcarpeta destino (p.ej. `Areas/testing_empty/OnlyTest`) |
+
+La carpeta se crea automáticamente si no existe.
+
+**Response 201:**
 ```json
 {
-  "status": "ok",
-  "id": "42"
+  "status": "uploaded",
+  "id": "01ABC...",
+  "name": "informe.json",
+  "size": 2048,
+  "webUrl": "https://...",
+  "drive_path": "/drive/root:/DailyDelivery"
 }
 ```
 
 ---
 
-### `GET /health`
+#### `GET /v1/graph/sites/{site_id}/drives/{drive_id}/items/{item_id}`
+
+Devuelve metadatos de un archivo o carpeta.
+
+**Response 200:**
+```json
+{
+  "id": "01ABC...",
+  "name": "informe.json",
+  "size": 2048,
+  "webUrl": "https://...",
+  "mime_type": "application/json",
+  "created_at": "2026-06-01T10:00:00Z",
+  "modified_at": "2026-06-09T08:30:00Z",
+  "download_url": "https://...pre-authenticated-url..."
+}
+```
+
+El campo `download_url` es una URL pre-autenticada válida ~1 hora (sin token Bearer).
+
+---
+
+#### `GET /v1/graph/sites/{site_id}/drives/{drive_id}/items/{item_id}/download`
+
+Descarga el contenido binario del archivo.
+
+**Response 200:** bytes del archivo con `Content-Type` del MIME real y `Content-Disposition: attachment; filename="..."`.
+
+---
+
+### Health
+
+#### `GET /health`
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "service": "SharePoint Connector", "version": "2.0.0" }
 ```
 
 ---
+
+### Cabeceras HTTP
+
+| Cabecera | Dirección | Descripción |
+|---|---|---|
+| `X-App-ID` | Request | Identificador del caller. Se registra en todos los logs |
+| `X-Request-ID` | Response | UUID generado por el middleware para trazabilidad |
 
 ### Códigos de error
 
 | Código | Causa |
 |---|---|
-| `400` | Parámetro inválido o faltante (`list_name` no configurado, drive no encontrado) |
-| `502` | Error en la llamada a Graph API (incluye el mensaje original de Microsoft) |
+| `400` | Parámetro inválido o faltante |
+| `401` | Fallo de autenticación con Microsoft Graph |
+| `403` | Permisos insuficientes (site sin grant, permisos Graph incorrectos) |
+| `404` | Recurso no encontrado en SharePoint |
+| `429` | Rate limit de Microsoft Graph — reintentar más tarde |
+| `500` | Error interno no controlado |
+| `502` | Error inesperado devuelto por Microsoft Graph |
 
 ---
 
-## 6. Seguridad y autenticación
+## 5. Autenticación y seguridad
 
 ```mermaid
 sequenceDiagram
@@ -259,30 +356,29 @@ sequenceDiagram
     participant AAD as Azure AD
     participant Graph as Microsoft Graph
 
-    Caller->>Connector: POST /upload o /list
+    Caller->>Connector: HTTP request + X-App-ID
+    Connector->>Connector: Asigna request_id (UUID)
     Connector->>Connector: ¿token en caché válido?
     alt token expirado o no existe
         Connector->>AAD: POST /oauth2/v2.0/token<br/>grant_type=client_credentials
         AAD-->>Connector: access_token (1h TTL)
         Connector->>Connector: guarda token en memoria
     end
-    Connector->>Graph: PUT o POST con Bearer token
+    Connector->>Graph: Llamada con Bearer token
     Graph-->>Connector: 200 / error
-    Connector-->>Caller: respuesta
+    Connector-->>Caller: respuesta + X-Request-ID
 ```
 
-### Modelo de permisos: `Sites.Selected`
+### Modelo de permisos: `Sites.Read.All` / `Sites.ReadWrite.All`
 
-El App Registration en Azure AD tiene el permiso **`Sites.Selected`**, el más restrictivo disponible para aplicaciones de servidor. A diferencia de `Sites.ReadWrite.All`, este permiso:
+El App Registration en Azure AD requiere los permisos de aplicación:
 
-- **No concede acceso a ningún site por defecto.**
-- Requiere que un administrador de SharePoint conceda acceso explícitamente a cada site mediante la Graph API o PowerShell.
-- Limita el radio de impacto ante una brecha de credenciales.
+- **`Sites.Read.All`** — para discovery y lectura de listas/archivos.
+- **`Sites.ReadWrite.All`** — para escritura (crear ítems, subir archivos).
 
-**Comando de activación (ejecutar una sola vez por un administrador):**
+Como alternativa más restrictiva se puede usar **`Sites.Selected`**, que limita el acceso a sites específicos. En ese caso, un administrador debe conceder acceso explícitamente:
 
 ```powershell
-# Requiere módulo PnP.PowerShell
 Connect-PnPOnline -Url "https://latinia.sharepoint.com" -Interactive
 
 Grant-PnPAzureADAppSitePermission `
@@ -292,7 +388,32 @@ Grant-PnPAzureADAppSitePermission `
   -Permissions Write
 ```
 
-Si el grant no está concedido, Graph devuelve `403 Forbidden` con mensaje explícito — trazable en los logs del conector.
+Si el grant no está concedido, Graph devuelve `403 Forbidden` — visible en los logs del conector con `request_id`.
+
+---
+
+## 6. Logging estructurado
+
+Todos los logs se emiten en JSON por `stdout`, compatibles con cualquier stack de observabilidad (ELK, Loki, CloudWatch, etc.).
+
+```json
+{
+  "timestamp": "2026-06-09T10:00:00.000Z",
+  "level": "INFO",
+  "logger": "app.services.sharepoint",
+  "message": "Uploaded file 'informe.json' (2048 bytes) → drive b!... / site hostname,...",
+  "module": "sharepoint",
+  "function": "upload_file",
+  "line": 167,
+  "request_id": "a1b2c3d4-...",
+  "client_app_id": "jirito-newsletter",
+  "site_id": "hostname,...",
+  "drive_id": "b!...",
+  "file_name": "informe.json"
+}
+```
+
+Campos estructurados disponibles: `request_id`, `client_app_id`, `method`, `path`, `status_code`, `duration_ms`, `site_id`, `list_id`, `drive_id`, `item_id`, `file_name`, `graph_url`, `graph_status`.
 
 ---
 
@@ -300,30 +421,28 @@ Si el grant no está concedido, Graph devuelve `403 Forbidden` con mensaje expl�
 
 ### Variables de entorno
 
-| Variable | Descripción | Ejemplo |
-|---|---|---|
-| `TENANT_ID` | ID del tenant Azure AD | `xxxxxxxx-...` |
-| `CLIENT_ID` | ID del App Registration | `xxxxxxxx-...` |
-| `CLIENT_SECRET` | Secreto del App Registration | `abc123~...` |
-| `SITE_URL` | URL del site SharePoint con grant | `https://latinia.sharepoint.com/sites/soporte` |
-| `DEFAULT_LIST_NAME` | Lista por defecto (opcional) | `Análisis Soporte` |
-| `DEFAULT_DRIVE_NAME` | Biblioteca por defecto | `Documents` |
-| `SP_PORT` | Puerto expuesto en el host | `8001` |
+| Variable | Requerida | Descripción | Ejemplo |
+|---|---|---|---|
+| `TENANT_ID` | Sí | ID del tenant Azure AD | `xxxxxxxx-...` |
+| `CLIENT_ID` | Sí | ID del App Registration | `xxxxxxxx-...` |
+| `CLIENT_SECRET` | Sí | Secreto del App Registration | `abc123~...` |
+| `LOG_LEVEL` | No | Nivel de log (`DEBUG`/`INFO`/`WARNING`/`ERROR`) | `INFO` |
+| `SP_PORT` | No | Puerto expuesto en el host | `8003` |
+
+> La API opera siempre con `site_id`, `list_id` y `drive_id` pasados como path params en cada llamada. Obtener estos IDs es el primer paso mediante los endpoints de discovery.
 
 ### Arranque con Docker Compose
 
 ```bash
-cp .env.example .env
-# Editar .env con los valores reales
-docker compose up -d --build
+cp devops/.env.example devops/.env
+# Editar devops/.env con los valores reales
+docker compose -f devops/docker-compose.yml up -d --build
 ```
 
 ### Integración en una red Docker existente
 
-Si el caller (p.ej. Jirito Newsletter) corre en la misma red Docker, el conector es accesible por nombre de servicio sin exponer puertos al exterior:
-
 ```yaml
-# docker-compose.yml del caller
+# docker-compose.yml del caller (p.ej. Jirito Newsletter)
 services:
   app:
     networks:
@@ -340,74 +459,59 @@ networks:
     driver: bridge
 ```
 
-El caller apunta a `http://sharepoint-connector:8000/upload` en lugar de la URL de Power Automate.
+El caller apunta a `http://sharepoint-connector:8003/v1/graph/...`.
 
 ---
 
-## 8. Migración desde Power Automate
+## 8. Flujo típico de uso
 
-El cambio en Jirito Newsletter se reduce a **una línea** por operación: reemplazar la URL del webhook.
+```
+1. GET /v1/graph/sites?search=soporte
+   → obtener site_id
 
-### En `WebhookService` (creación de ítems en lista)
+2. GET /v1/graph/sites/{site_id}/lists
+   → obtener list_id
 
-```python
-# Antes
-payload = {
-    "organization": ...,
-    "issue": ...,
-    "value_analysis_cliente": ...,
-    # ... campos planos directo a PA
-}
-requests.post(pa_webhook_url, json=payload)
+3. GET /v1/graph/sites/{site_id}/drives
+   → obtener drive_id
 
-# Después
-payload = {
-    "list_name": "Análisis Soporte",   # opcional si está configurado por defecto
-    "fields": {
-        "organization": ...,
-        "issue": ...,
-        "value_analysis_cliente": ...,
-        # ... mismos campos
-    }
-}
-requests.post("http://sharepoint-connector:8000/list", json=payload)
+4. POST /v1/graph/sites/{site_id}/lists/{list_id}/items
+   → crear ítem en lista
+
+5. POST /v1/graph/sites/{site_id}/drives/{drive_id}/files?folder=DailyDelivery
+   → subir archivo (multipart/form-data)
+
+6. GET /v1/graph/sites/{site_id}/drives/{drive_id}/items/{item_id}/download
+   → descargar archivo
 ```
 
-### En `SharePointService` (subida de archivos)
-
-```python
-# Antes — payload a PA
-payload = {"token": ..., "folder": ..., "filename": ..., "data": ...}
-requests.post(pa_upload_url, json=payload)
-
-# Después — mismo payload, nueva URL
-requests.post("http://sharepoint-connector:8000/upload", json=payload)
-```
-
-El campo `token` sigue funcionando (se acepta y se ignora), por lo que el payload no necesita cambiar.
+Los IDs de site, lista y drive son estables; solo es necesario hacer discovery una vez y cachear los resultados en el caller.
 
 ---
 
-## 9. Comparativa
+## 9. Comparativa con versión anterior (v1)
 
-| Aspecto | Power Automate | SharePoint Connector |
+| Aspecto | v1.0.0 | v2.0.0 |
 |---|---|---|
-| **Trazabilidad de errores** | Parcial — 408/429/5xx no visibles | Total — código HTTP + mensaje en logs |
-| **Control de reintentos** | Automático y opaco | Implementable con lógica propia |
-| **Dependencia de plataforma** | Microsoft Power Automate | Solo Microsoft Graph (API estándar) |
-| **Mantenimiento** | Flujos visuales en portal externo | Código Python en el mismo repo |
-| **Genericidad** | Flujo fijo por caso de uso | Un servicio para cualquier app |
-| **Coste** | Licencia Power Automate | Coste de infraestructura Docker |
-| **Latencia** | Variable (flujo cloud) | Directa a Graph API |
-| **Permisos** | Configurados en el conector PA | `Sites.Selected` — mínimo privilegio |
+| **Endpoints** | `POST /upload`, `POST /list` | API REST versionada `/v1/graph/...` con 9 endpoints |
+| **Scope** | Site único fijo (env var `SITE_URL`) | Multi-site dinámico — site/lista/drive en cada llamada |
+| **Discovery** | No disponible | Endpoints para explorar sites, listas, drives y carpetas |
+| **Subida de archivos** | JSON con `data` en Base64 | `multipart/form-data` — más eficiente y estándar |
+| **Descarga de archivos** | No disponible | `GET .../download` — bytes directos con Content-Type |
+| **Metadatos de archivo** | No disponible | `GET .../items/{item_id}` con `download_url` pre-autenticada |
+| **Logging** | Básico | JSON estructurado con `request_id`, `client_app_id`, duración |
+| **Trazabilidad** | Parcial | `X-Request-ID` en respuesta + contexto propagado a services |
+| **Manejo de errores** | Genérico | `GraphAPIError` tipado con códigos 400/401/403/404/429/502 |
+| **Estructura de módulos** | Plana (`app/*.py`) | Capas separadas: `core/`, `api/v1/`, `schemas/`, `services/` |
 
 ---
 
-## 10. Limitaciones conocidas (v1)
+## 10. Limitaciones conocidas (v2)
 
 | Limitación | Condición | Solución futura |
 |---|---|---|
 | Tamaño máximo de archivo | 4 MB (límite de `PUT .../content` en Graph) | Implementar upload sessions para archivos mayores |
-| Site único | Un site por instancia del conector | Múltiples instancias o soporte multi-site |
+| Sin paginación en discovery | Resultados truncados si hay >1000 sites/listas/drives | Implementar `@odata.nextLink` |
 | Sin cola de reintentos | Fallo en Graph → error inmediato al caller | Añadir cola interna con reintentos exponenciales |
 | Sin autenticación entre caller y conector | El servicio confía en cualquier caller en la red | Añadir API key o JWT en cabecera `X-Api-Key` |
+| Token en memoria (no distribuido) | Una sola instancia — token no compartido entre réplicas | Externalizar caché de token (Redis) para alta disponibilidad |

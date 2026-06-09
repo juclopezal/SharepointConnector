@@ -15,10 +15,7 @@
 5. [httpx](#5-httpx)
 6. [Uvicorn](#6-uvicorn)
 7. [Microsoft Graph API](#7-microsoft-graph-api)
-8. [OAuth 2.0 — Client Credentials Flow](#8-oauth-20--client-credentials-flow)
-9. [Permiso Sites.Selected](#9-permiso-sitesselected)
-10. [Docker y Docker Compose](#10-docker-y-docker-compose)
-11. [Decisiones descartadas](#11-decisiones-descartadas)
+8. [Docker y Docker Compose](#8-docker-y-docker-compose)
 
 ---
 
@@ -312,107 +309,7 @@ Site ID, Drive ID y List ID se resuelven una sola vez por vida del proceso y se 
 
 ---
 
-## 8. OAuth 2.0 — Client Credentials Flow
-
-### Qué es
-OAuth 2.0 es el protocolo estándar de autorización para APIs modernas (RFC 6749). El **Client Credentials Flow** es la variante diseñada para comunicaciones **servidor a servidor** (sin usuario interactivo), donde una aplicación se autentica con su propia identidad.
-
-### Flujo de autenticación
-
-```
-sharepoint-connector                Azure AD
-        │                               │
-        │  POST /oauth2/v2.0/token      │
-        │  client_id=...                │
-        │  client_secret=...            │
-        │  grant_type=client_credentials│
-        │  scope=graph.microsoft.com/.d │
-        │──────────────────────────────▶│
-        │                               │
-        │  { access_token, expires_in } │
-        │◀──────────────────────────────│
-        │                               │
-        │  GET/POST graph.microsoft.com │
-        │  Authorization: Bearer <token>│
-        │──────────────────────────────▶ Graph API
-```
-
-### Token cache en el conector
-
-El `TokenManager` implementa una caché simple en memoria:
-
-```python
-async def get_token(self) -> str:
-    # Reutiliza el token si aún es válido (con margen de 60s)
-    if self._token and time.time() < self._expires_at - 60:
-        return self._token
-    # Si no, obtiene uno nuevo de Azure AD
-    ...
-```
-
-Los tokens de Azure AD tienen un TTL de **3600 segundos (1 hora)**. El conector los renueva automáticamente cuando quedan menos de 60 segundos para expirar, evitando que una llamada en curso use un token ya expirado.
-
-### Credenciales requeridas
-
-| Parámetro | Dónde obtenerlo |
-|---|---|
-| `TENANT_ID` | Azure Portal → Azure Active Directory → Overview |
-| `CLIENT_ID` | Azure Portal → App Registrations → tu app → Application (client) ID |
-| `CLIENT_SECRET` | Azure Portal → App Registrations → tu app → Certificates & secrets |
-
----
-
-## 9. Permiso Sites.Selected
-
-### Qué es
-`Sites.Selected` es un tipo de permiso de aplicación de Microsoft Graph que permite conceder acceso a **sites específicos de SharePoint**, en lugar de a todos los sites del tenant (como haría `Sites.ReadWrite.All`).
-
-### Por qué es importante
-
-```
-Sites.ReadWrite.All         Sites.Selected
-        │                         │
-        ▼                         ▼
-  Acceso a TODOS           Acceso solo a
-  los sites del            los sites
-  tenant                   explícitamente
-                           autorizados
-```
-
-Con `Sites.Selected`, si las credenciales del conector se comprometieran, el atacante solo podría acceder a los sites autorizados, no a todo el SharePoint de la organización.
-
-### Cómo se activa
-
-El permiso `Sites.Selected` se declara en el App Registration en Azure AD, pero **no otorga acceso por sí solo**. Un administrador de SharePoint debe conceder acceso explícitamente a cada site:
-
-```powershell
-# Usando PnP.PowerShell
-Grant-PnPAzureADAppSitePermission `
-  -AppId "<CLIENT_ID>" `
-  -DisplayName "SharePoint Connector" `
-  -Site "https://latinia.sharepoint.com/sites/yoursite" `
-  -Permissions Write
-```
-
-Niveles de permiso disponibles:
-
-| Nivel | Capacidades |
-|---|---|
-| `Read` | Solo lectura de archivos y listas |
-| `Write` | Lectura y escritura (suficiente para este servicio) |
-| `FullControl` | Administración completa del site |
-
-### Verificación
-
-Para confirmar que el grant está activo:
-
-```powershell
-Get-PnPAzureADAppSitePermission -AppIdentity "<CLIENT_ID>"
-```
-
----
-
-## 10. Docker y Docker Compose
+## 8. Docker y Docker Compose
 
 ### Qué es
 **Docker** es una plataforma de contenerización que empaqueta una aplicación junto con todas sus dependencias en una unidad portable llamada *contenedor*. Los contenedores son aislados del sistema operativo anfitrión y entre sí.
@@ -470,38 +367,3 @@ jirito-app ──▶ http://sharepoint-connector:8003/upload
 
 Esto evita exposición innecesaria del conector a la red exterior.
 
----
-
-## 11. Decisiones descartadas
-
-### SDK oficial de Microsoft (`msal`, `msgraph-sdk-python`)
-
-Microsoft ofrece librerías oficiales para Python:
-- `msal`: manejo de autenticación OAuth2
-- `msgraph-sdk-python`: cliente tipado para Graph API
-
-**Por qué se descartaron:** añaden complejidad y dependencias para un conjunto reducido de operaciones (upload file + create list item). Con `httpx` y el flujo OAuth2 implementado directamente, el servicio tiene cero dependencias de SDKs de terceros de Microsoft, menor superficie de actualización y total control sobre las llamadas HTTP.
-
-### SharePoint REST API clásica (`_api/`)
-
-La API REST clásica de SharePoint (disponible en `https://tenant.sharepoint.com/sites/site/_api/`) es una alternativa viable pero presenta desventajas:
-
-- No funciona bien con `Sites.Selected` en todos los escenarios.
-- Requiere el endpoint específico por tenant/site, complicando la configuración.
-- Microsoft la mantiene en modo legacy, con menor inversión en documentación y nuevas funcionalidades.
-
-### Cola de mensajes (Redis, RabbitMQ)
-
-Se evaluó añadir una cola de mensajes para desacoplar el caller del conector y gestionar reintentos de forma asíncrona. Se descartó para v1 por:
-
-- Añade infraestructura adicional que aumenta la complejidad operativa.
-- El volumen de operaciones actual no justifica el overhead.
-- Está identificado como mejora futura en `ARQUITECTURA.md §10`.
-
-### Base de datos de auditoría
-
-Se consideró persistir cada operación (timestamp, payload, respuesta, código HTTP) en SQLite para trazabilidad histórica. Se descartó para v1 porque:
-
-- Los logs de Uvicorn ya capturan esta información.
-- Añade estado al contenedor, complicando los reinicios y la gestión de volúmenes.
-- Se puede añadir de forma incremental sin cambiar la API.

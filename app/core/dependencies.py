@@ -1,7 +1,7 @@
 from functools import lru_cache
 
-from app.auth import TokenManager
-from app.config import settings
+from app.core.auth import TokenManager
+from app.core.config import settings
 from app.services.sharepoint import SharePointService
 
 

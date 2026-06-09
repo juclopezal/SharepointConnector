@@ -459,7 +459,7 @@ cmd_help() {
     echo ""
     bold "  PRIMERA VEZ:"
     echo "    1. cp devops/.env.example devops/.env"
-    echo "    2. Editar devops/.env con TENANT_ID, CLIENT_ID, CLIENT_SECRET y SITE_URL"
+    echo "    2. Editar devops/.env con TENANT_ID, CLIENT_ID y CLIENT_SECRET"
     echo "    3. ./deploy.sh start"
     echo ""
     bold "  EJEMPLOS:"
