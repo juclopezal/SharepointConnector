@@ -1,3 +1,87 @@
+## v2.2.1 — 2026-06-11
+
+### Fix: Endurecimiento de seguridad y paginación de Graph
+
+**Contexto:** Una revisión del código detectó tres grupos de problemas: (1) entradas del caller interpoladas sin validar en URLs de Graph (inyección OData vía `filter_by.field`, escape de carpeta vía `filename`/`folder` en subidas), (2) ausencia de límite de tamaño en uploads (el archivo se bufferizaba entero en memoria antes de fallar en Graph) y falta de seguimiento de la paginación de Graph (`@odata.nextLink`), que podía producir 404/409 falsos en sites con muchas listas/drives o listas grandes, y (3) higiene de configuración (ruta de logs personal hardcodeada como default, `VERSION` ausente de la imagen Docker → `/health` reportaba `0.0.0`).
+
+**Cambios:**
+- **Anti-inyección OData** — `filter_by.field` se valida contra `[A-Za-z0-9_]+` tanto en el schema (`422`) como en el servicio (`400`, defensa en profundidad); la expresión `$filter` completa se percent-encodea.
+- **Saneo del path de subida** — `filename` y `folder` se rechazan con `400` si contienen `..`, separadores (`/` en filename, `\`) o caracteres de control; cada segmento se percent-encodea antes de construir la URL de Graph (`_encode_drive_path`).
+- **Límite de subida** — los dos endpoints de upload leen como máximo 4 MB + 1 byte y responden `413` si se supera, sin bufferizar el archivo completo ni llamar a Graph (`app/core/uploads.py`).
+- **Paginación** — nuevo helper `_get_all()` que sigue `@odata.nextLink`; aplicado a `list_sites`, `list_site_lists`, `list_site_drives`, `list_folder_children` y `find_list_items_by_field`. El término `search` de `/sites` también se percent-encodea.
+- **Configuración** — `log_dir` ya no tiene una ruta personal hardcodeada como default (vacío = solo consola; configurable con `LOG_DIR`/`LOG_FILE`). El Dockerfile copia `VERSION`, de modo que `/health` reporta la versión real.
+
+**Archivos nuevos:**
+- `app/core/uploads.py` — `read_upload()` con `MAX_UPLOAD_BYTES`
+- `tests/test_sharepoint_service.py` — 22 tests (saneo de paths, validación de campo, escape OData, paginación)
+
+**Archivos modificados:**
+- `app/services/sharepoint.py` — `_encode_drive_path`, `_get_all`, validación de `field`, encoding de `$filter` y `search`
+- `app/schemas/sharepoint.py` — `FilterBy.field` con `pattern`
+- `app/api/v1/endpoints/sharepoint.py`, `app/api/v1/endpoints/files.py` — uso de `read_upload()`
+- `app/core/config.py` — default de `log_dir` vacío
+- `devops/Dockerfile` — `COPY VERSION .`
+- `devops/.env.example` — variables `LOG_DIR`/`LOG_FILE`
+- `tests/test_sharepoint_endpoints.py`, `tests/test_files_endpoint.py` — tests de `422` y `413`
+- `VERSION`, `README.md`, `ARQUITECTURA.md`, `TECNOLOGIAS.md` — documentación a v2.2.1
+
+---
+
+## v2.2.0 — 2026-06-10
+
+### Feature: Actualización de ítems de lista por URL localizados por campo único
+
+**Contexto:** Los endpoints by-URL de la v2.1.0 solo permitían **crear** ítems. Actualizar un registro existente exigía conocer su `item_id` interno de Graph, dato del que el caller no dispone: solo tiene la URL de la lista y algún valor de negocio que identifica la fila (p.ej. un código `LATSUP-0000`).
+
+**Solución:** Se añade `PATCH /v1/sharepoint/list/item`, que localiza el registro mediante `filter_by` (`field` + `value`) y aplica `data`. El conector busca el ítem vía Graph (`$filter` sobre `fields/{field}`) para obtener su `id` interno y luego actualiza sus campos. El `filter_by` debe identificar un único registro.
+
+```json
+{
+  "sharepoint_url": "https://host.sharepoint.com/Oper/Lists/Incidencias/View.aspx",
+  "filter_by": { "field": "_x006c_dq4", "value": "LATSUP-0000" },
+  "data": { "Title": "Actualización", "Atendida": false }
+}
+```
+
+Comportamiento según las coincidencias de `filter_by`: `200` si hay exactamente una (ítem actualizado), `404` si ninguna, `409` si más de una (filtro no único — no se modifica nada). La búsqueda añade la cabecera `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly` porque las columnas custom no suelen estar indexadas; el valor se trata como texto y se escapa según OData.
+
+**Archivos modificados:**
+- `app/services/sharepoint.py` — helper `_patch`, `_get` admite `extra_headers`, y nuevos métodos `find_list_items_by_field()` y `update_list_item()`
+- `app/api/v1/endpoints/sharepoint.py` — endpoint `PATCH /v1/sharepoint/list/item`
+- `app/schemas/sharepoint.py` — modelos `FilterBy`, `ListItemUpdateByUrlRequest`, `ListItemUpdateByUrlResponse`
+- `tests/test_sharepoint_endpoints.py` — 3 tests nuevos (éxito, 404, 409)
+- `VERSION`, `README.md`, `ARQUITECTURA.md`, `TECNOLOGIAS.md` — documentación a v2.2.0
+
+---
+
+## v2.1.0 — 2026-06-10
+
+### Feature: Endpoints orientados a usuario con resolución por URL (SPEC-002)
+
+**Contexto:** La v2.0.0 exige que el caller conozca `site_id`, `list_id` y `drive_id` de Graph. Obtener esos identificadores es inviable para un usuario humano, que solo dispone de la URL de SharePoint tal como aparece en el navegador.
+
+**Solución:** Se añade una capa de resolución (`SharePointResolver`) y dos endpoints nuevos que aceptan una URL "humana" y derivan internamente los identificadores de Graph:
+- `POST /v1/sharepoint/list/item` — inserta un ítem en una lista a partir de su URL.
+- `POST /v1/sharepoint/upload` — sube un archivo a una biblioteca/carpeta a partir de su URL (`multipart/form-data`).
+
+El site se resuelve con `GET /sites/{host}:/{path}` recortando segmentos hacia la raíz (cubre raíz, managed paths como `/Oper`, `/sites/X`, `/teams/X` y subsites). Las listas se emparejan por `webUrl`/nombre y las bibliotecas por prefijo del `webUrl` del drive, con la carpeta destino tomada del parámetro `?id=` cuando está presente. Los IDs de site resueltos se cachean (son estables). Las claves de `data` siguen siendo los nombres internos de columna.
+
+Los endpoints `/v1/graph/...` de la v2.0.0 se mantienen intactos como API de bajo nivel/discovery.
+
+**Archivos nuevos:**
+- `app/services/resolver.py` — `SharePointResolver` (parseo de URL, resolución de site/lista/drive/carpeta)
+- `app/api/v1/endpoints/sharepoint.py` — endpoints `POST /v1/sharepoint/list/item` y `POST /v1/sharepoint/upload`
+- `app/schemas/sharepoint.py` — modelos de request/response by-URL
+- `tests/test_resolver.py`, `tests/test_sharepoint_endpoints.py` — 13 tests nuevos
+
+**Archivos modificados:**
+- `app/services/sharepoint.py` — nuevo método `get_site_by_path(hostname, path)`
+- `app/core/dependencies.py` — singleton `get_resolver()`
+- `app/api/v1/router.py` — registro del router `sharepoint`
+- `VERSION`, `README.md`, `ARQUITECTURA.md` — documentación a v2.1.0
+
+---
+
 ## v2.0.0 — 2026-06-09
 
 ### Refactor: Arquitectura dinámica multi-site con API versionada (SPEC-001)

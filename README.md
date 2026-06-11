@@ -2,13 +2,26 @@
 
 Microservicio REST que reemplaza Power Automate para operaciones sobre SharePoint vía Microsoft Graph API. Expone una API genérica y versionada que opera sobre cualquier site, lista y biblioteca de documentos de forma dinámica.
 
-**Versión actual:** 2.0.0
+**Versión actual:** 2.2.1
 
 ---
 
 ## Endpoints
 
-Todos los endpoints están bajo `/v1/graph`. Ver [ARQUITECTURA.md](ARQUITECTURA.md) para la referencia completa.
+El conector ofrece dos niveles de API:
+
+- **`/v1/sharepoint`** — orientada a usuario: se pasa una **URL de SharePoint** (la de la barra de direcciones del navegador) y el conector resuelve por sí mismo los identificadores de Graph. Es la vía recomendada cuando quien llama es una persona.
+- **`/v1/graph`** — de bajo nivel: opera con `site_id`/`list_id`/`drive_id` ya conocidos (obtenidos vía discovery). Útil para integraciones que cachean los IDs.
+
+Ver [ARQUITECTURA.md](ARQUITECTURA.md) para la referencia completa.
+
+### SharePoint (por URL)
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| `POST` | `/v1/sharepoint/list/item` | Inserta un ítem en una lista identificada por su URL |
+| `PATCH` | `/v1/sharepoint/list/item` | Actualiza un ítem localizándolo por un campo único (`filter_by`) |
+| `POST` | `/v1/sharepoint/upload` | Sube un archivo a una biblioteca/carpeta identificada por su URL (`multipart/form-data`) |
 
 ### Discovery
 
@@ -37,12 +50,68 @@ Todos los endpoints están bajo `/v1/graph`. Ver [ARQUITECTURA.md](ARQUITECTURA.
 ### Health
 
 ```
-GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.0.0" }
+GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.2.1" }
 ```
 
 ---
 
-## Flujo de uso típico
+## Uso por URL (recomendado para usuarios)
+
+No requiere conocer los IDs de Graph: basta con la URL de SharePoint.
+
+### Crear un ítem en una lista
+
+```bash
+curl -X POST "http://localhost:8003/v1/sharepoint/list/item" \
+  -H "Content-Type: application/json" \
+  -H "X-App-ID: mi-app" \
+  -d '{
+    "sharepoint_url": "https://latinia2com-portal8.sharepoint.com/Oper/Lists/Registro%20incidencias%2024x7/View_RegistroInci.aspx",
+    "data": {
+      "Title": "Incidencia en servidor de producción",
+      "Prioridad": "Alta",
+      "Responsable": "jlopeza@latinia.com"
+    }
+  }'
+```
+
+Las claves de `data` deben ser los **nombres internos** de las columnas.
+
+### Actualizar un ítem de una lista
+
+Se localiza el registro con `filter_by` (un campo único y su valor) y se aplican los cambios de `data`:
+
+```bash
+curl -X PATCH "http://localhost:8003/v1/sharepoint/list/item" \
+  -H "Content-Type: application/json" \
+  -H "X-App-ID: mi-app" \
+  -d '{
+    "sharepoint_url": "https://latinia2com-portal8.sharepoint.com/Oper/Lists/Registro%20incidencias%2024x7/View_RegistroInci.aspx",
+    "filter_by": { "field": "_x006c_dq4", "value": "LATSUP-0000" },
+    "data": {
+      "Title": "Prueba de inyección - actualización",
+      "y4ap": "Baja",
+      "Atendida": false
+    }
+  }'
+```
+
+`filter_by` debe identificar un **único** registro: si ninguno coincide se devuelve `404`, y si coincide más de uno, `409` (sin modificar nada).
+
+### Subir un archivo
+
+```bash
+curl -X POST "http://localhost:8003/v1/sharepoint/upload" \
+  -H "X-App-ID: mi-app" \
+  -F "sharepoint_url=https://latinia2com.sharepoint.com/sites/IADocs/Documentos%20compartidos/Forms/AllItems.aspx?id=%2Fsites%2FIADocs%2FDocumentos%20compartidos%2FAreas%2FAdvisors%2FOnlyTest" \
+  -F "file=@./TAM.txt"
+```
+
+El conector resuelve la URL a `site_id` + `drive_id` + carpeta destino; la carpeta del parámetro `?id=` se crea automáticamente si no existe.
+
+---
+
+## Flujo de uso típico (API de bajo nivel)
 
 ```
 1. GET /v1/graph/sites?search=soporte         → obtener site_id
@@ -66,6 +135,8 @@ Copia `devops/.env.example` a `devops/.env` y rellena los valores:
 | `CLIENT_ID` | Sí | ID del App Registration |
 | `CLIENT_SECRET` | Sí | Secreto del App Registration |
 | `LOG_LEVEL` | No | `DEBUG` / `INFO` / `WARNING` / `ERROR` (default: `INFO`) |
+| `LOG_DIR` | No | Directorio del log rotativo a fichero; vacío = solo consola (default: vacío) |
+| `LOG_FILE` | No | Nombre del fichero de log (default: `api_server_sp_connector.log`) |
 | `SP_PORT` | No | Puerto expuesto en el host (default: `8003`) |
 
 ### Permisos Azure AD requeridos
@@ -98,7 +169,7 @@ curl -X POST "http://localhost:8003/v1/graph/sites/{site_id}/drives/{drive_id}/f
   -F "file=@informe.json"
 ```
 
-La carpeta se crea automáticamente si no existe. El tamaño máximo es **4 MB** (límite de `PUT .../content` en Graph API).
+La carpeta se crea automáticamente si no existe. El tamaño máximo es **4 MB** (límite de `PUT .../content` en Graph API); si se supera, el conector responde `413` sin llamar a Graph.
 
 ---
 

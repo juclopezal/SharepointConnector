@@ -1,6 +1,8 @@
 import json
 import logging
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 _EXTRA_FIELDS = frozenset({
@@ -39,10 +41,30 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log_obj, ensure_ascii=False, default=str)
 
 
-def configure_logging(level: str = "INFO") -> None:
-    handler = logging.StreamHandler()
-    handler.setFormatter(JSONFormatter())
+def configure_logging(
+    level: str = "INFO",
+    log_dir: str = "",
+    log_file: str = "api_server_sp_connector.log",
+) -> None:
+    formatter = JSONFormatter()
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     root.handlers.clear()
-    root.addHandler(handler)
+
+    # Console output (stdout/stderr) — picked up by Docker, k8s, etc.
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root.addHandler(stream_handler)
+
+    # Persistent file output for traceability. Rotates at 10 MB, keeps 5 backups.
+    if log_dir:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path / log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)

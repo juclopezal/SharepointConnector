@@ -42,3 +42,21 @@ async def test_upload_passes_folder_to_service(client, fake_sp):
     body = resp.json()
     assert body["status"] == "uploaded"
     assert body["id"] == "01ABC"
+
+
+async def test_upload_too_large_returns_413(client, fake_sp):
+    uploaded = {"called": False}
+
+    async def fake_upload(**kwargs):
+        uploaded["called"] = True
+        return {}
+
+    fake_sp.upload_file = fake_upload
+
+    resp = client.post(
+        "/v1/graph/sites/site1/drives/drive1/files",
+        files={"file": ("big.bin", b"x" * (4 * 1024 * 1024 + 1), "application/octet-stream")},
+    )
+
+    assert resp.status_code == 413
+    assert uploaded["called"] is False

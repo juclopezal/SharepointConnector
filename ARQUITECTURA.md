@@ -1,7 +1,7 @@
 # Arquitectura: SharePoint Connector
 
-**Versión:** 2.0.0  
-**Fecha:** 2026-06-09  
+**Versión:** 2.2.1  
+**Fecha:** 2026-06-11  
 **Autor:** Juan Camilo López Alzate — Latinia  
 
 ---
@@ -39,9 +39,9 @@ graph LR
     end
 
     subgraph GRAPH["Microsoft Graph API v1.0"]
-        GS[/sites — Discovery]
-        GL[/sites/{id}/lists — List Items]
-        GF[/sites/{id}/drives — Files]
+        GS["/sites — Discovery"]
+        GL["/sites/{id}/lists — List Items"]
+        GF["/sites/{id}/drives — Files"]
     end
 
     subgraph SP["SharePoint"]
@@ -76,6 +76,7 @@ graph TD
         EP_DISC["discovery.py\nGET /sites\nGET /sites/{id}/lists\nGET /sites/{id}/drives\nGET /sites/{id}/drives/{id}/items"]
         EP_LIST["list_items.py\nGET  /sites/{id}/lists/{id}/items\nPOST /sites/{id}/lists/{id}/items"]
         EP_FILE["files.py\nPOST /sites/{id}/drives/{id}/files\nGET  /sites/{id}/drives/{id}/items/{id}\nGET  /sites/{id}/drives/{id}/items/{id}/download"]
+        EP_SP["sharepoint.py (by URL)\nPOST  /sharepoint/list/item\nPATCH /sharepoint/list/item\nPOST  /sharepoint/upload"]
     end
 
     subgraph "app/core"
@@ -91,16 +92,21 @@ graph TD
         SCH_D["discovery.py"]
         SCH_F["files.py"]
         SCH_L["list_items.py"]
+        SCH_SP["sharepoint.py"]
     end
 
     subgraph "app/services"
         SRV["sharepoint.py\nSharePointService"]
+        RES["resolver.py\nSharePointResolver"]
     end
 
-    EP_DISC & EP_LIST & EP_FILE --> DEP
+    EP_DISC & EP_LIST & EP_FILE & EP_SP --> DEP
     EP_DISC --> SCH_D
     EP_FILE --> SCH_F
     EP_LIST --> SCH_L
+    EP_SP --> SCH_SP
+    EP_SP --> RES
+    RES --> SRV
     DEP --> SRV
     DEP --> AUTH
     SRV --> CTX
@@ -124,16 +130,101 @@ graph TD
 | **Discovery** | `app/api/v1/endpoints/discovery.py` | Endpoints de exploración (sites, listas, drives, carpetas) |
 | **List Items** | `app/api/v1/endpoints/list_items.py` | Lectura y creación de ítems en listas |
 | **Files** | `app/api/v1/endpoints/files.py` | Subida, metadata y descarga de archivos |
+| **SharePoint (by URL)** | `app/api/v1/endpoints/sharepoint.py` | Endpoints orientados a usuario: crear / actualizar ítem y subir archivo a partir de una URL |
 | **Schemas** | `app/schemas/` | Modelos Pydantic de request/response por dominio |
-| **SharePointService** | `app/services/sharepoint.py` | Cliente HTTP de Graph API (GET, POST, PUT, descarga) |
+| **SharePointService** | `app/services/sharepoint.py` | Cliente HTTP de Graph API (GET, POST, PATCH, PUT, descarga, búsqueda y actualización de ítems, resolución de site) |
+| **SharePointResolver** | `app/services/resolver.py` | Traducción de URLs de SharePoint a `site_id`/`list_id`/`drive_id`+carpeta |
 
 ---
 
 ## 4. API
 
-Todos los endpoints están bajo el prefijo `/v1/graph`.
+El conector expone dos niveles de API bajo `/v1`:
+
+- **`/v1/sharepoint`** — orientada a usuario. El caller pasa la **URL de SharePoint** y el conector resuelve internamente los identificadores de Graph mediante `SharePointResolver`.
+- **`/v1/graph`** — de bajo nivel. Opera con `site_id`/`list_id`/`drive_id` explícitos (obtenidos vía discovery).
+
+### Capa de resolución de URL (`SharePointResolver`)
+
+`SharePointResolver` traduce una URL "humana" de SharePoint a los identificadores que Graph necesita:
+
+1. **Site:** se intenta `GET /sites/{host}:/{path}` con la ruta de la URL y, ante un `404`, se recorta el último segmento y se reintenta hacia la raíz. El primer path que resuelve es el *web* más profundo que contiene el recurso. Cubre de forma uniforme la raíz, managed paths (`/Oper`), `/sites/{x}`, `/teams/{x}` y subsites anidados. Los IDs de site resueltos se cachean (son estables).
+2. **Lista** (`POST` y `PATCH /v1/sharepoint/list/item`): se localiza el segmento tras `/Lists/` y se empareja contra las listas del site por `webUrl` (coincidencia exacta) con fallback a `displayName`/`name`. La misma resolución sirve para crear (`POST`) y para actualizar (`PATCH`).
+3. **Biblioteca y carpeta** (`POST /v1/sharepoint/upload`): la carpeta destino se toma del parámetro `?id=` (ruta servidor) o de la propia ruta sin la página de formulario. La biblioteca es el drive cuyo `webUrl` es el prefijo más largo de esa ruta; el resto es la carpeta destino (que se crea automáticamente al subir).
+
+```mermaid
+graph LR
+    URL["URL SharePoint<br/>(navegador)"] --> R[SharePointResolver]
+    R -->|GET /sites/host:/path<br/>recorte hacia raíz| SID[site_id]
+    R -->|match webUrl / nombre| LID[list_id]
+    R -->|match prefijo webUrl drive| DID[drive_id + carpeta]
+    SID & LID & DID --> SRV[SharePointService<br/>create_list_item / update_list_item / upload_file]
+```
+
+### SharePoint (por URL)
+
+#### `POST /v1/sharepoint/list/item`
+
+Inserta un ítem en la lista identificada por su URL.
+
+**Request:**
+```json
+{
+  "sharepoint_url": "https://host.sharepoint.com/Oper/Lists/Incidencias/View.aspx",
+  "data": { "Title": "LATSUP-6585", "Prioridad": "Alta" }
+}
+```
+
+> Las claves de `data` son los **nombres internos** de las columnas (igual que `fields` en `/v1/graph`).
+
+**Response 201:**
+```json
+{ "status": "created", "id": "42", "webUrl": "https://...", "site_id": "...", "list_id": "..." }
+```
+
+#### `PATCH /v1/sharepoint/list/item`
+
+Actualiza un ítem existente de la lista identificada por su URL. El registro a modificar se localiza con `filter_by` (`field` + `value`), que debe identificar un **único** ítem: el conector lo busca vía Graph para obtener su `id` interno y después aplica `data`.
+
+**Request:**
+```json
+{
+  "sharepoint_url": "https://host.sharepoint.com/Oper/Lists/Incidencias/View.aspx",
+  "filter_by": { "field": "_x006c_dq4", "value": "LATSUP-0000" },
+  "data": { "Title": "Actualización", "y4ap": "Baja", "Atendida": false }
+}
+```
+
+> Tanto `filter_by.field` como las claves de `data` son los **nombres internos** de las columnas. `filter_by.value` se trata como texto.
+
+La búsqueda usa `GET .../items?$expand=fields&$filter=fields/{field} eq '{value}'` con la cabecera `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly` (las columnas custom no suelen estar indexadas). La actualización es `PATCH .../items/{id}/fields` con el conjunto de campos sin envolver.
+
+| Resultado de `filter_by` | Respuesta |
+|---|---|
+| 1 coincidencia | `200` — ítem actualizado |
+| 0 coincidencias | `404` — ningún registro coincide |
+| > 1 coincidencia | `409` — el filtro no es único; no se modifica nada |
+
+**Response 200:**
+```json
+{ "status": "updated", "id": "7", "webUrl": "https://...", "site_id": "...", "list_id": "..." }
+```
+
+#### `POST /v1/sharepoint/upload`
+
+Sube un archivo a la biblioteca/carpeta identificada por su URL. Cuerpo `multipart/form-data` con `sharepoint_url` y `file`.
+
+**Response 201:**
+```json
+{ "status": "uploaded", "id": "01ABC...", "name": "TAM.txt", "size": 2048,
+  "webUrl": "https://...", "site_id": "...", "drive_id": "...", "folder": "Areas/Advisors/OnlyTest" }
+```
+
+---
 
 ### Discovery
+
+> Los endpoints de discovery, list items y files siguientes están bajo `/v1/graph` y operan con identificadores explícitos.
 
 #### `GET /v1/graph/sites`
 
@@ -321,7 +412,7 @@ Descarga el contenido binario del archivo.
 #### `GET /health`
 
 ```json
-{ "status": "ok", "service": "SharePoint Connector", "version": "2.0.0" }
+{ "status": "ok", "service": "SharePoint Connector", "version": "2.2.1" }
 ```
 
 ---
@@ -340,7 +431,8 @@ Descarga el contenido binario del archivo.
 | `400` | Parámetro inválido o faltante |
 | `401` | Fallo de autenticación con Microsoft Graph |
 | `403` | Permisos insuficientes (site sin grant, permisos Graph incorrectos) |
-| `404` | Recurso no encontrado en SharePoint |
+| `404` | Recurso no encontrado en SharePoint (incluye `filter_by` sin coincidencias en `PATCH /v1/sharepoint/list/item`) |
+| `409` | Conflicto: `filter_by` coincide con más de un registro en `PATCH /v1/sharepoint/list/item` |
 | `429` | Rate limit de Microsoft Graph — reintentar más tarde |
 | `500` | Error interno no controlado |
 | `502` | Error inesperado devuelto por Microsoft Graph |

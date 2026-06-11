@@ -1,7 +1,7 @@
 # Tecnologías utilizadas — SharePoint Connector
 
-**Versión:** 1.0.0  
-**Fecha:** 2026-05-20  
+**Versión:** 2.2.1  
+**Fecha:** 2026-06-11  
 **Autor:** Juan Camilo López Alzate — Latinia  
 
 ---
@@ -85,8 +85,8 @@ Python es un lenguaje de programación interpretado, de tipado dinámico y sinta
 ### Características de Python 3.12 aprovechadas
 | Característica | Uso en el proyecto |
 |---|---|
-| `str \| None` (union types) | Campos opcionales en modelos Pydantic |
-| `dict[str, Any]` genérico | Tipado del campo `fields` en `ListPayload` |
+| `str \| None` (union types) | Campos opcionales en modelos Pydantic (p.ej. `webUrl` en las respuestas) |
+| `dict[str, Any]` genérico | Tipado del campo `fields`/`data` en los schemas de lista (`CreateListItemRequest`, `ListItemByUrlRequest`) |
 | `asyncio` nativo | Soporte async/await en toda la capa de servicio |
 
 ---
@@ -114,12 +114,12 @@ FastAPI genera automáticamente documentación interactiva en `/docs` (Swagger U
 
 ```python
 # app/main.py
-app = FastAPI(title="SharePoint Connector", version="1.0.0")
-app.include_router(upload.router)
-app.include_router(list_item.router)
+app = FastAPI(title=settings.app_name, version=settings.app_version)
+app.include_router(v1_router)   # agrupa /v1/sharepoint/... y /v1/graph/...
 ```
 
-- Cada endpoint (`/upload`, `/list`, `/health`) está definido en un router independiente.
+- El título y la versión se leen de `Settings` (la versión, a su vez, del archivo `VERSION`), evitando duplicar el número en el código.
+- Los endpoints se organizan en routers por dominio (`discovery`, `list_items`, `files`, `sharepoint`), agrupados bajo el router `/v1`; `/health` cuelga directamente de la app.
 - FastAPI valida automáticamente el JSON de entrada contra los modelos Pydantic antes de llegar al handler.
 - Si el JSON no cumple el esquema, devuelve `422 Unprocessable Entity` con detalle del campo inválido — sin escribir una sola línea de validación manual.
 
@@ -141,34 +141,48 @@ Una vez levantado el contenedor, la documentación interactiva está disponible 
 ### Por qué se eligió
 - FastAPI usa Pydantic internamente, por lo que no añade dependencias extra.
 - Permite definir el esquema de la API y la validación en un solo lugar (el modelo), sin duplicar lógica.
-- El campo `fields: dict[str, Any]` en `ListPayload` es posible gracias a la flexibilidad de Pydantic con tipos genéricos.
+- El campo `fields`/`data` de tipo `dict[str, Any]` en los schemas de lista es posible gracias a la flexibilidad de Pydantic con tipos genéricos.
 
 ### Cómo se usa en el proyecto
 
-**Modelos de entrada (app/models.py):**
+**Modelos de entrada (app/schemas/):**
+
+Los modelos están organizados por dominio en `app/schemas/` (`discovery.py`, `list_items.py`, `files.py`, `sharepoint.py`). Los campos de lista se tipan como `dict[str, Any]` para aceptar cualquier columna de SharePoint:
 ```python
-class ListPayload(BaseModel):
-    token: Optional[str] = None   # campo opcional, ignorado
-    list_name: Optional[str] = None
+# app/schemas/list_items.py — API de bajo nivel
+class CreateListItemRequest(BaseModel):
     fields: dict[str, Any]        # acepta cualquier tipo
+
+# app/schemas/sharepoint.py — API por URL (actualización por campo único)
+class FilterBy(BaseModel):
+    field: str                    # nombre interno de columna
+    value: str                    # valor que identifica el registro
+
+class ListItemUpdateByUrlRequest(BaseModel):
+    sharepoint_url: str
+    filter_by: FilterBy
+    data: dict[str, Any]
 ```
 
-Pydantic acepta en `fields` valores de tipo `str`, `int`, `float`, `bool` y `list` sin configuración adicional — simplemente los pasa tal cual a Graph API.
+Pydantic acepta en `fields`/`data` valores de tipo `str`, `int`, `float`, `bool` y `list` sin configuración adicional — simplemente los pasa tal cual a Graph API. La validación anidada (`filter_by` como submodelo `FilterBy`) la resuelve Pydantic automáticamente.
 
-**Configuración desde entorno (app/config.py):**
+**Configuración desde entorno (app/core/config.py):**
 ```python
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env")
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
+    # Azure AD / Microsoft Identity Platform
     tenant_id: str          # obligatorio — falla al arrancar si no está
     client_id: str          # obligatorio
     client_secret: str      # obligatorio
-    site_url: str           # obligatorio
-    default_list_name: str = ""        # opcional con default
-    default_drive_name: str = "Documents"
+
+    # Application
+    app_name: str = "SharePoint Connector"
+    app_version: str = _read_version()   # leído del archivo VERSION
+    log_level: str = "INFO"
 ```
 
-Si una variable obligatoria no está definida en el entorno, el servicio **falla al arrancar** con un mensaje claro indicando qué falta — evitando arranques en estado inconsistente.
+Desde la v2.0.0 el servicio es **multi-site**: ya no existe un `SITE_URL` fijo en configuración; el site, la lista y la biblioteca se identifican en cada llamada (por ID en `/v1/graph` o resueltos desde la URL en `/v1/sharepoint`). Si una variable obligatoria (`tenant_id`/`client_id`/`client_secret`) no está definida en el entorno, el servicio **falla al arrancar** con un mensaje claro indicando qué falta — evitando arranques en estado inconsistente.
 
 ---
 
@@ -196,14 +210,17 @@ El servicio usa `async/await` en toda la capa de llamadas a Graph API. Usar `req
 # app/services/sharepoint.py
 _TIMEOUT = httpx.Timeout(60.0)  # uploads pueden llegar a 4 MB sobre SharePoint
 
-async def _get(self, url: str) -> dict:
+async def _get(self, url: str, extra_headers: dict | None = None) -> dict:
+    headers = await self._auth_headers()
+    if extra_headers:
+        headers.update(extra_headers)   # p.ej. Prefer para $filter no indexado
     async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
-        r = await c.get(url, headers=await self._headers())
+        r = await c.get(url, headers=headers)
         r.raise_for_status()   # lanza excepción en 4xx/5xx con el cuerpo del error
         return r.json()
 ```
 
-El método `raise_for_status()` propaga el error HTTP original de Graph API (incluyendo su mensaje), que el router captura y devuelve al caller con código `502`.
+El método `raise_for_status()` propaga el error HTTP original de Graph API (incluyendo su mensaje), que el router captura y devuelve al caller con código `502`. El parámetro opcional `extra_headers` permite añadir cabeceras puntuales por llamada (como `Prefer` en la búsqueda por campo) sin alterar el resto de peticiones. Para escritura existen los helpers análogos `_post`, `_patch` (actualización de ítems) y `_put_bytes` (subida de archivos).
 
 ---
 
@@ -287,7 +304,27 @@ Content-Type: application/json
   }
 }
 ```
-Graph API espera nativamente el wrapper `{"fields": {...}}`, por lo que el diseño del endpoint `/list` del conector es un reflejo directo de la API de Microsoft.
+Graph API espera nativamente el wrapper `{"fields": {...}}`, por lo que el diseño del endpoint `POST /v1/graph/.../items` del conector es un reflejo directo de la API de Microsoft.
+
+#### Búsqueda de ítem por campo
+```
+GET https://graph.microsoft.com/v1.0/sites/{site-id}/lists/{list-id}/items?$expand=fields&$filter=fields/{campo} eq '{valor}'
+Prefer: HonorNonIndexedQueriesWarningMayFailRandomly
+```
+Para localizar el ítem a actualizar a partir de un campo único, se usa `$filter` sobre `fields/{campo}`. Como las columnas *custom* de SharePoint no suelen estar **indexadas**, Graph rechazaría la consulta salvo que se envíe la cabecera `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly`, que la autoriza explícitamente (Microsoft advierte que en listas muy grandes puede fallar de forma intermitente). El valor se escapa según OData (las comillas simples se duplican).
+
+#### Actualización de ítem en lista
+```
+PATCH https://graph.microsoft.com/v1.0/sites/{site-id}/lists/{list-id}/items/{item-id}/fields
+Content-Type: application/json
+
+{
+  "Title": "Prueba de inyección - actualización",
+  "_x006c_dq4": "LATSUP-0001",
+  "Atendida": false
+}
+```
+A diferencia de la creación (`POST .../items`), el `PATCH` apunta al subrecurso `/fields` del ítem y el cuerpo es el conjunto de campos **sin** el wrapper `{"fields": {...}}`. Devuelve el `fieldValueSet` actualizado.
 
 ### Caché de IDs
 

@@ -2,6 +2,7 @@ from functools import lru_cache
 
 from app.core.auth import TokenManager
 from app.core.config import settings
+from app.services.resolver import SharePointResolver
 from app.services.sharepoint import SharePointService
 
 
@@ -13,3 +14,8 @@ def _token_manager() -> TokenManager:
 @lru_cache
 def get_sp() -> SharePointService:
     return SharePointService(_token_manager())
+
+
+@lru_cache
+def get_resolver() -> SharePointResolver:
+    return SharePointResolver(get_sp())

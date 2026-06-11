@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import Response
 
 from app.core.dependencies import get_sp
+from app.core.uploads import read_upload
 from app.schemas.files import FileMetadataResponse, UploadFileResponse
 from app.services.sharepoint import SharePointService
 
@@ -43,7 +44,7 @@ async def upload_file(
     - `GET /v1/graph/sites/{site_id}/drives` → `drive_id`
     """
     logger.info("upload_file → folder=%r filename=%r", folder, file.filename)
-    data = await file.read()
+    data = await read_upload(file)
     result = await sp.upload_file(
         site_id=site_id,
         drive_id=drive_id,

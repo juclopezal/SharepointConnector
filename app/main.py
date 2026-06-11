@@ -14,7 +14,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import configure_logging
 
-configure_logging(settings.log_level)
+configure_logging(settings.log_level, settings.log_dir, settings.log_file)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(

@@ -24,5 +24,10 @@ class Settings(BaseSettings):
     app_version: str = _read_version()
     log_level: str = "INFO"
 
+    # Logging to file (in addition to console). Empty log_dir disables the file log.
+    # Set via LOG_DIR env var / .env when persistent file logs are needed.
+    log_dir: str = ""
+    log_file: str = "api_server_sp_connector.log"
+
 
 settings = Settings()
