@@ -292,3 +292,9 @@ Los nombres de campo deben ser los **nombres internos** de las columnas en Share
 ---
 
 Ver [ARQUITECTURA.md](ARQUITECTURA.md) para la referencia completa de la API, diagramas de arquitectura y detalles de despliegue.
+
+## Repositorio
+
+Actualmente, el repositorio de la aplicación se accede por medio de esta URL:
+
+'''https://devg.corp.latiniaservices.com/juclopezal/SharepointConnector'''
