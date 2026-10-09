@@ -1,3 +1,58 @@
+## v2.6.0 — 2026-09-03
+
+### Feature: Operadores de filtro (`in`, `ge`, `gt`, `le`, `lt`) en items:search (SPEC-004)
+
+**Contexto:** `POST /v1/sharepoint/list/items:search` solo sabía expresar igualdad, y solo unida con AND. Cualquier pregunta de la forma «dame las filas que están en uno de estos estados» o «dame las finalizadas en los últimos 15 días» no se podía formular: el caller tenía que emitir una petición HTTP por valor aceptado, unir las respuestas y volver a filtrarlas en cliente. El caso que lo motivó — los ítems de `HistorialConsumoBolsas` cuyo `Estado` es *Para Entregar*, *Iniciado* o *Pausado*, más los *Completado* de los últimos 15 días — costaba **4 llamadas al conector más un post-filtrado con `jq`**, y el corte por fecha obligaba a descargar el histórico completo de filas completadas para descartar casi todas, chocando además con el techo de `top`/`has_more`.
+
+**Solución:** Campo opcional `op` en cada condición de `filters`, con `eq` por defecto. Enum **cerrado** de seis operadores: ningún token del caller puede llegar a la expresión OData generada.
+
+| `op`                | `value`                     | Columnas admitidas |
+|---------------------|-----------------------------|--------------------|
+| `eq`                | escalar                     | todas |
+| `in`                | array de 1–20, mismo tipo   | todas menos Sí/No |
+| `ge` `gt` `le` `lt` | escalar                     | número, moneda, fecha/hora, `{Columna}LookupId` |
+
+```json
+{ "sharepoint_url": "https://.../Lists/HistorialConsumoBolsas/AllItems.aspx",
+  "filters": [
+    { "field": "Estado", "op": "in",
+      "value": ["Para Entregar", "Iniciado", "Pausado"] },
+    { "field": "Entorno", "value": "L02" }
+  ] }
+```
+
+genera, antes de percent-encodear:
+
+```
+(fields/Estado eq 'Para Entregar' or fields/Estado eq 'Iniciado' or fields/Estado eq 'Pausado') and fields/Entorno eq 'L02'
+```
+
+- **`in` se expande a un grupo OR de igualdades entre paréntesis**, no al operador nativo `in` de OData: su comportamiento contra `fields/{columna}` en listas de SharePoint no está verificado, y si no estuviera soportado el fallo sería el peligroso — cláusula descartada y `200` con todas las filas. Los paréntesis son obligatorios: sin ellos la precedencia entre `or` y el `and` que une los filtros cambiaría el significado de toda la expresión. Un array de un solo elemento también va entre paréntesis, para que la forma generada no dependa de su longitud.
+- **El OR existe solo dentro de un `in`.** Entre condiciones el enlace sigue siendo AND, sin cambios.
+- **Los operadores se validan contra el esquema real de la lista** antes de llamar a Graph: `ge`/`gt`/`le`/`lt` sobre una columna de texto o *choice* → `400` (OData compararía lexicográficamente y el resultado parecería plausible); `in` sobre una columna Sí/No → `400` (dos valores posibles: o `eq` redundante o tautología que devuelve todo). El error nombra la columna, su tipo y los operadores que ese tipo sí admite. **No cuesta ninguna llamada extra a Graph:** lee las mismas definiciones de columna cacheadas que ya usan las comprobaciones de campo y de tipo.
+- **Fechas: ISO-8601 en UTC tal como viene.** Un valor de comparación se interpreta exactamente en el instante dado (sin zona → UTC; con offset → normalizado a UTC) y el conector **no** le aplica `TENANT_TIMEZONE`. Divergencia deliberada con el `period` del upsert, donde el conector calcula los límites y por eso sí necesita la zona: desplazar en silencio un instante explícito haría que el mismo string señalara filas distintas en cada despliegue. Un valor no parseable → `400` con el nombre de la columna y el formato esperado.
+- **Literal de fecha entrecomillado — y esto se midió, porque la suposición inicial era falsa.** OData 4.0 especifica un `dateTimeOffset` desnudo, pero sobre columnas de listas de SharePoint Graph lo rechaza con `400 invalidRequest` (igual con milisegundos, con offset `+00:00`, solo fecha, o `datetime'…'`), mientras que el entrecomillado sí filtra. Verificado el 2026-09-03 contra la lista DSL real (columna `Modified`, 9.320 filas): `ge '2018-01-01T00:00:00Z'` → 9.127 filas con mínimo `2018-02-15`, el `lt` complementario → 193 filas con máximo `2017-07-28`, y **9.127 + 193 = 9.320**, el total exacto de la lista. La partición perfecta es lo que prueba que la cláusula se evalúa. Graph se comporta aquí **al revés que con los booleanos**, donde el literal desnudo `1`/`0` es el que filtra: sobre estas columnas la forma del literal se decide midiendo, no leyendo la especificación.
+- Lo que el camino consciente del tipo de columna aporta sobre el entrecomillado genérico es **validar** el valor como instante ISO-8601 (`"18/08/2026"` → `400` explícito en vez de una cláusula que no puede coincidir) y **canonicalizarlo a UTC**, reemitiéndolo desde el valor parseado en vez de copiarlo. Confirmado: `2026-06-01T00:00:00Z`, `2026-06-01T02:00:00+02:00`, `2026-06-01T00:00:00` y `2026-06-01` devuelven las mismas 590 filas. Se aplica a los operadores nuevos; `eq` conserva la traducción de la v2.5.0 sin validar, y **queda confirmado que `eq` sobre columna de fecha ya filtraba bien** (`eq '2026-09-02T14:15:45Z'` → exactamente 1 fila de 9.320): no había defecto preexistente.
+- **Texto: Graph compara sin distinguir mayúsculas.** `eq 'L02'` también devuelve las filas guardadas como `l02` — aplica igual a `in`, y significa que un `in` no sirve para distinguir valores que solo difieren en la caja. Sin cambios en el conector; documentado porque nada en la API lo insinúa.
+- **Presupuesto de cláusulas:** el tope de 15 filtros sigue igual y un `in` admite hasta 20 valores, pero el total de cláusulas generadas tras la expansión no puede pasar de **100** → `422` indicando el número generado y el límite. ⚠️ El techo real de Graph, medido por bisección el 2026-09-03, **no se cuenta en cláusulas sino en longitud de URL** (~4,9–5,2 KB, `404 UnknownError` al pasarse): caben 115 cláusulas cortas de texto, 88 de lookup y solo **73 de fecha**. Es decir, el presupuesto de 100 admite peticiones que Graph rechazará cuando las cláusulas son largas. El fallo es el honesto (un `404` propagado, no una cláusula descartada en silencio), pero queda como **seguimiento**: presupuestar por longitud del `$filter` generado (~3 KB sin encodear) en vez de por número de cláusulas.
+- **Frontera `422`/`400` sin mover:** `422` es lo que se juzga con el body a solas (`op` fuera del enum; `in` con escalar u otro operador con array; array vacío, de más de 20 o de tipos mezclados —`[true, 1]` incluido, porque `bool` no se colapsa en `int`—; presupuesto excedido); `400` lo que exige conocer la lista (columna inexistente, operador no admitido por el tipo, tipo de valor equivocado en cualquier elemento de un `in`, fecha no parseable). Ninguna condición nueva se delega a Graph.
+- **El umbral de vista de SharePoint (~5000 filas) no se levanta.** Al contrario: un grupo OR o una comparación sobre una columna no indexada es candidato preferente a un `notSupported` de Graph, que se propaga con su detalle. `ge`/`le` sí reducen cuántas veces se topa uno con el corte de `top`, pero `has_more` sigue sin cursor de paginación.
+
+**Retrocompatible: `op` es opcional y `eq` por defecto**, así que todo body escrito para la v2.5.0 produce el mismo `$filter` y los mismos ítems. Ningún campo de la respuesta cambia de forma.
+
+**Fuera de alcance, a propósito:** grupos OR anidados entre campos distintos — «(tres estados abiertos) O (Completado Y fecha reciente)» en una sola petición — que exigirían diseñar un lenguaje de consulta en el body; los operadores de este cambio ya llevan el caso motivador de 4 llamadas a 2. Tampoco se añade el cursor de paginación de `has_more`, ni los operadores `ne`, `contains`, `startswith` o las comprobaciones de nulo, cada uno con su propio perfil de fallo silencioso y su propia evidencia pendiente.
+
+**Verificación empírica (2026-09-03, lista DSL real, Docker local, v2.6.0 en `/health`):** todos los criterios en verde tras corregir el literal de fecha; detalle fila a fila en `requirements/SPEC-004`.
+
+**Archivos modificados:**
+- `app/schemas/sharepoint.py` — `op` (`Literal` cerrado) y `value` ampliado a array en `SearchFilter`; validador de concordancia `op`↔forma de `value`, cotas y homogeneidad del array de `in`; validador del presupuesto de 100 cláusulas en `ListItemsSearchByUrlRequest`
+- `app/services/sharepoint.py` — familia de tipo de columna en `_search_field_expected_type()`; `_check_search_operator()` con la matriz operador × tipo; `_to_odata_datetime_literal()`; `_build_search_clause()` (grupo OR entre paréntesis y cláusulas de comparación); comprobación de tipo por elemento y revalidación del operador en el servicio
+- `app/api/v1/endpoints/sharepoint.py` — paso de `op` al servicio, `op` en el log y documentación del endpoint en `/docs` (tabla de operadores y ejemplos)
+- `tests/test_sharepoint_service.py`, `tests/test_sharepoint_endpoints.py` — 82 tests nuevos (210/210 en verde)
+- `VERSION`, `README.md`, `ARQUITECTURA.md`, `arquitecturasUML.md`, `requirements/SPEC-004` — documentación a v2.6.0
+
+---
+
 ## v2.5.0 — 2026-07-22
 
 ### Feature: Proyección de campos con `select` en items:search (SPEC-004)

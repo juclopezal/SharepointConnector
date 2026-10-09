@@ -1,66 +1,124 @@
 schema: spec-driven
 context: |
-  Idea del proyecto: Gestor de proyectos con Proyectos, Tareas y Miembros
-  Stack tecnológico: Node.js, Express, Supabase (cliente @supabase/supabase-js)
-  Autenticación: Login básico vía Supabase Auth, sin roles diferenciados
-    (cualquier usuario autenticado tiene las mismas capacidades generales;
-    los permisos específicos dependen de la relación con el recurso, no de un rol)
-  Autorización a nivel de datos: Row Level Security (RLS) de Supabase
-    - Las políticas de acceso (quién puede leer/escribir qué fila) se definen en RLS,
-      no reimplementadas manualmente en el código de Express
-    - El backend confía en RLS como última línea de defensa, pero las reglas de
-      negocio (ver abajo) también deben reflejarse en la lógica de la aplicación
-      cuando afecten la experiencia del usuario (mensajes de error, validaciones previas)
+  Idea del proyecto: SharePoint Connector — microservicio REST que actúa de
+    intermediario entre clientes internos y SharePoint Online a través de la
+    Microsoft Graph API. Sustituye flujos de Power Automate por una API propia,
+    versionada, trazable y testeable.
+  Stack tecnológico: Python 3.13, FastAPI, Pydantic v2 (+ pydantic-settings),
+    httpx asíncrono, pytest. Empaquetado en Docker (devops/docker-compose.yml).
+  Autenticación contra Microsoft: Azure AD client credentials (flujo app-only, sin
+    usuario). El App Registration tiene permisos de aplicación Sites.Read.All y
+    Sites.ReadWrite.All sobre todo el tenant. `TokenManager` cachea el token en
+    memoria y lo renueva 60s antes de que expire.
+  Autenticación de los clientes del conector: NO EXISTE hoy. La cabecera `X-App-ID`
+    es informativa (solo se registra en los logs) y ni siquiera es obligatoria.
+    Todo cambio que toque la superficie pública debe tenerlo presente: el servicio
+    opera con permisos amplios sobre el tenant y no valida quién le llama.
 
-  Modelo de entidades:
-  - Usuario: id, nombre, email, password (gestionado por Supabase Auth)
-  - Proyecto: id, nombre, descripción, estado (activo | archivado), fecha_creacion, dueño_id
-  - Miembro: tabla intermedia (proyecto_id, usuario_id) — relación muchos-a-muchos
-    entre Usuario y Proyecto
-  - Tarea: id, titulo, descripcion, estado (pendiente | en_progreso | completada),
-    fecha_limite, proyecto_id, asignado_a (nullable, referencia a Miembro)
+  Superficie de la API — dos capas deliberadas:
+  - `/v1/sharepoint` — orientada a persona: el caller pasa la URL de SharePoint tal
+    como la copia del navegador y el conector resuelve `site_id`/`list_id`/`drive_id`
+    por sí mismo (`app/services/resolver.py`).
+  - `/v1/graph` — de bajo nivel: opera con IDs ya conocidos, para integraciones que
+    los cachean. Incluye los endpoints de discovery.
+  El servicio es genérico: el sitio, la lista y la biblioteca viajan en cada llamada.
+  No hay listas, columnas ni sitios cableados en el código.
 
-  Reglas de negocio:
-  - Solo el dueño del proyecto puede eliminarlo o archivarlo
-  - No se puede eliminar un proyecto si tiene tareas activas (pendiente o en_progreso)
-  - Solo un miembro del proyecto puede tener tareas asignadas dentro de ese proyecto
-  - Una tarea no puede pasar a estado "completada" si el proyecto está archivado
-  - Un usuario no puede ser eliminado como miembro si tiene tareas asignadas sin reasignar
+  Principio rector del diseño (el más importante):
+    **Microsoft Graph falla en silencio; el conector no.**
+    Graph ignora sin error cláusulas `$filter` mal formadas sobre columnas Sí/No,
+    descarta los nombres desconocidos en `$select` y trata `$top` como tamaño de
+    página y no como límite total. Este servicio existe, en buena parte, para
+    convertir esos fallos silenciosos en errores HTTP explícitos y accionables.
+    Toda funcionalidad nueva debe preguntarse primero: "¿en qué caso devolvería
+    Graph un 200 engañoso, y cómo lo convierto en un 400 que nombre el problema?".
+
+  Contrato con el caller: los **nombres internos** (internal name) de las columnas
+    de SharePoint forman parte del contrato público, no son un detalle de
+    implementación. Los requisitos y ejemplos deben nombrarlos explícitamente,
+    incluidos los codificados (`_x006c_dq4`, `_x00da_ltima`) y los sintéticos de las
+    columnas lookup (`{Columna}LookupId`).
+
+  Estado y concurrencia: proceso único, sin base de datos. Todo el estado es caché
+    en memoria: IDs de site (permanente — no cambian durante la vida del proceso) y
+    definiciones de columna por `(site_id, list_id)` con TTL de 300s (las columnas
+    sí pueden añadirse o renombrarse). Los servicios son singletons vía `@lru_cache`
+    en `app/core/dependencies.py`.
+
+  Semántica de errores ya establecida:
+  - `422` — validación de Pydantic sobre el body (tipo JSON, longitudes,
+    `extra="forbid"`). No llega a tocar Graph.
+  - `400` — validación del conector contra el esquema real de la lista (columna
+    inexistente, tipo que no corresponde, lookup sin el sufijo `LookupId`) o URL de
+    SharePoint no reconocible. Tampoco llega a Graph.
+  - `404` / `409` — recurso no encontrado / más de una coincidencia donde el
+    contrato exige unicidad.
+  - `413` — fichero por encima del límite de 4 MB de `PUT .../content`.
+  - `429` / `502` — errores de Graph propagados conservando su `detail`.
+  Toda respuesta de error incluye `request_id` y `path`.
+
+  Limitaciones conocidas y asumidas (contexto, no necesariamente a resolver):
+  - `filters` en `items:search` solo combina igualdades con AND: sin `or`, `in`,
+    rangos ni `contains`.
+  - `top` + `has_more` sin cursor: si `has_more` es true, el caller no tiene forma
+    de pedir la página siguiente.
+  - No hay reintentos ni respeto a `Retry-After` ante el 429 de Graph.
+  - Ordenar por columnas no indexadas en listas por encima del umbral de vista de
+    SharePoint (~5000 filas) lo rechaza Graph con `notSupported`.
+
+  Documentación viva que todo cambio debe mantener coherente: `README.md`,
+    `ARQUITECTURA.md`, `arquitecturasUML.md`, `doc/CHANGELOG.md`, `VERSION`, y la
+    spec numerada en `requirements/SPEC-00N_*.md` (convención descrita en
+    `requirements/00_SDD_GUIDELINES.md`, con su sección de **Bitácora de IA**).
+
+  Despliegue: dos entornos separados — Docker Desktop local y el host remoto
+    `docker-ag`, actualizado por SSH con `devops/deploy.sh update --pull`. El
+    despliegue es un paso manual posterior al merge, nunca automatizado por un change.
 
   Lenguaje de producto:
-  - Escribe los requisitos en términos de lo que el usuario final observa
-    (qué puede hacer, qué respuesta recibe, qué error ve), no en términos de
-    tablas, políticas RLS o queries de Supabase
-  - Evita mencionar el nombre exacto de columnas o tablas en los requisitos de negocio;
-    eso pertenece a design.md
-  - Prefiere expresar las reglas como resultados positivos del usuario
-    ("un proyecto archivado impide completar tareas") en vez de negaciones técnicas
-    ("el sistema NO permitirá un UPDATE si...")
+  - Aquí el "usuario final" es un integrador que llama por HTTP. Los requisitos se
+    escriben en términos del **contrato observable**: cuerpo de la petición, código
+    de estado, forma de la respuesta y texto del mensaje de error.
+  - Sí se nombran campos, columnas y claves de respuesta: son el contrato. Lo que NO
+    pertenece a los requisitos es el detalle interno (métodos privados, estructura
+    de las cachés, sintaxis exacta de OData) — eso vive en design.md.
+  - Prefiere expresar la regla como el resultado que el caller observa ("una columna
+    inexistente en `select` se rechaza nombrándola") y no como la mecánica interna
+    ("el servicio compara contra `_columns_cache`").
 
 rules:
   specs:
-    - "Cada endpoint debe documentar caso feliz y al menos un caso de error (400, 401, 403, 404, 409)"
-    - "Especificar código HTTP esperado para cada escenario observable"
-    - "Las 5 reglas de negocio deben aparecer como escenarios explícitos en specs de Proyecto y Tarea"
-    - "No mencionar RLS, políticas de Supabase, ni nombres de tablas; solo comportamiento observable del usuario"
-    - "Cuando una operación depende de la relación usuario-proyecto (dueño vs miembro vs no relacionado), cubrir los 3 casos"
-    - "Describir qué ve el usuario en cada respuesta (mensaje de error amigable, no códigos internos)"
-    - "Incluir escenarios de validación previa (ej: no puedo completar tarea si proyecto está archivado)"
+    - "Cada endpoint debe documentar el caso feliz y, como mínimo, un caso de error por cada código que pueda devolver (400, 404, 409, 413, 422, 429, 502)"
+    - "Distinguir explícitamente 422 (validación de Pydantic sobre el body) de 400 (validación del conector contra el esquema real de la lista): son dos requisitos distintos, no dos redacciones del mismo"
+    - "Todo comportamiento silencioso de Microsoft Graph que el conector convierta en error explícito necesita su propio escenario, redactado en negativo: 'NO devuelve 200 con las filas sin filtrar', 'NO acepta el nombre desconocido descartándolo'"
+    - "Los escenarios nombran los campos internos reales de columna, incluidos los codificados (_x00da_ltima) y los sintéticos de lookup ({Columna}LookupId); no se sustituyen por nombres genéricos"
+    - "Todo campo opcional nuevo debe tener un escenario de retrocompatibilidad que fije que omitirlo, o enviarlo vacío ([]), produce exactamente el comportamiento anterior — nunca un 422"
+    - "Cubrir siempre el resultado vacío como caso legítimo: 0 coincidencias es 200 con total: 0, nunca 404"
+    - "Cuando el cambio afecte a la lectura de listas, cubrir explícitamente la paginación: truncado por `top` y valor de `has_more` cuando quedaron filas fuera"
+    - "Cuando entre en juego una columna lookup, cubrir sus dos formas (nombre base y {Columna}LookupId) y decir cuál es válida en ese contexto y cuál se rechaza"
+    - "Especificar el código HTTP y la forma de la respuesta para cada escenario observable; los errores incluyen request_id y path"
 
   tasks:
-    - "Incluir tarea explícita para setup de Supabase Auth (crear auth provider, configurar JWT)"
-    - "Incluir tarea para definición de políticas RLS por tabla (usuarios, proyectos, miembros, tareas)"
-    - "Incluir tarea de creación de esquema: 4 tablas con llaves foráneas y constraints exactos"
-    - "Incluir tarea de seed/datos de prueba para validar las 5 reglas de negocio manualmente"
-    - "Incluir tarea de middleware de autenticación (validar token JWT en cada request)"
-    - "Incluir tarea de documentación de API (endpoints, payloads, respuestas de error, ejemplos)"
-    - "Agrupar tasks por fases: Setup → Auth → CRUD Proyectos → CRUD Miembros → CRUD Tareas → Testing"
+    - "Agrupar las tareas por fases en este orden: Schemas → Servicio → Endpoint → Tests → Documentación → Verificación empírica → Despliegue"
+    - "Cada tarea cita el archivo concreto que toca (app/schemas/sharepoint.py, app/services/sharepoint.py, app/api/v1/endpoints/sharepoint.py, tests/...)"
+    - "Incluir SIEMPRE una fase final de verificación empírica contra una lista real del tenant (https://latinia2com-portal8.sharepoint.com/Oper/...), no solo tests con dobles: los fallos silenciosos de Graph no se reproducen con mocks"
+    - "Cada verificación empírica declara qué resultado concreto sería un bug bloqueante, para que no se confunda con una anomalía de los datos"
+    - "Incluir tarea de tests de esquema (422): campo desconocido en el body, tipo JSON no soportado, límites de longitud y de rango"
+    - "Incluir tarea de tests de validación contra el esquema de la lista (400): columna inexistente, tipo que no corresponde, lookup mal referenciado"
+    - "Incluir tarea de test de retrocompatibilidad por cada campo opcional nuevo (omitido y [] ≡ comportamiento previo)"
+    - "Incluir tarea de ejecutar la suite completa (pytest) y confirmar ausencia de regresiones"
+    - "Incluir tareas de documentación: README.md, ARQUITECTURA.md, arquitecturasUML.md, entrada en doc/CHANGELOG.md y bump de VERSION"
+    - "Incluir tarea de crear o extender la spec numerada en requirements/SPEC-00N_*.md, rellenando su Bitácora de IA (extender la existente si es el mismo endpoint; no abrir una nueva por cada iteración)"
+    - "Incluir el despliegue como seguimiento manual explícito (Docker local y host docker-ag vía deploy.sh update --pull), nunca como tarea automatizada"
 
   design:
-    - "Documentar esquema exacto de cada tabla (columnas, tipos, llaves foráneas, constraints, índices)"
-    - "Documentar políticas RLS de Supabase que implementan cada regla de negocio (quién puede SELECT/INSERT/UPDATE/DELETE)"
-    - "Documentar qué validaciones ocurren en Express (previas, con mensaje amigable al usuario) vs cuáles quedan a nivel RLS"
-    - "Especificar constraints únicos (ej: unique(proyecto_id, usuario_id) en tabla miembros)"
-    - "Documentar flujo de autenticación: cómo se obtiene token de Supabase, cómo se valida en Express, dónde se guarda"
-    - "No incluir código; solo definiciones, relaciones, políticas y decisiones arquitectónicas"
-    - "Documentar la relación muchos-a-muchos entre Usuario y Proyecto vía tabla Miembro explícitamente"
+    - "Numerar las decisiones de diseño para que las tareas puedan referenciarlas ('per design.md decision 4')"
+    - "Documentar la expresión OData exacta que se genera ($filter, $orderby, $expand=fields($select=...)), incluyendo comillas, escapado y percent-encoding"
+    - "Documentar todo fallo silencioso de Graph que motive una decisión, con la evidencia empírica que lo demuestra y su fecha (p. ej. booleanos como 1/0, verificado contra la lista DSL el 2026-07-22)"
+    - "Documentar explícitamente el reparto de validaciones: qué rechaza Pydantic (422) y qué rechaza el servicio contra el esquema real de la lista (400), y por qué esa frontera"
+    - "Documentar toda caché nueva o modificada: clave, TTL y la justificación de por qué caduca o por qué no (los site IDs son estables; las columnas no)"
+    - "Documentar el impacto sobre el estado en memoria y la concurrencia: el servicio es un proceso único con singletons vía @lru_cache"
+    - "Documentar la validación anti-inyección de los nombres de columna (patrón alfanumérico + guion bajo) cuando el cambio construya expresiones OData, incluida la defensa en profundidad en la capa de servicio"
+    - "Justificar la elección entre extender un endpoint existente y crear uno nuevo, y declarar si el cambio es retrocompatible"
+    - "Documentar el impacto sobre las limitaciones conocidas (ausencia de cursor de paginación, ausencia de reintentos ante 429, umbral de vista de SharePoint): resolverlas, o dejar constancia de que se mantienen"
+    - "No incluir código: solo decisiones, contratos, formas de datos y sus razones"

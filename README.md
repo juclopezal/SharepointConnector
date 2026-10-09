@@ -2,7 +2,7 @@
 
 Microservicio REST que reemplaza Power Automate para operaciones sobre SharePoint vía Microsoft Graph API. Expone una API genérica y versionada que opera sobre cualquier site, lista y biblioteca de documentos de forma dinámica.
 
-**Versión actual:** 2.5.0
+**Versión actual:** 2.6.0
 
 ---
 
@@ -22,7 +22,7 @@ Ver [ARQUITECTURA.md](ARQUITECTURA.md) para la referencia completa.
 | `POST` | `/v1/sharepoint/list/item` | Inserta un ítem en una lista identificada por su URL |
 | `PATCH` | `/v1/sharepoint/list/item` | Actualiza un ítem localizándolo por un campo único (`filter_by`) |
 | `POST` | `/v1/sharepoint/list/item:upsert` | Inserta o actualiza un ítem según coincidencia por clave (+ periodo opcional) |
-| `POST` | `/v1/sharepoint/list/items:search` | Busca ítems con hasta 15 filtros multi-campo (AND), validados contra el esquema de la lista |
+| `POST` | `/v1/sharepoint/list/items:search` | Busca ítems con hasta 15 filtros multi-campo (AND) y operadores `eq`/`in`/`ge`/`gt`/`le`/`lt`, validados contra el esquema de la lista |
 | `POST` | `/v1/sharepoint/upload` | Sube un archivo a una biblioteca/carpeta identificada por su URL (`multipart/form-data`) |
 
 ### Discovery
@@ -52,7 +52,7 @@ Ver [ARQUITECTURA.md](ARQUITECTURA.md) para la referencia completa.
 ### Health
 
 ```
-GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.5.0" }
+GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.6.0" }
 ```
 
 ---
@@ -136,9 +136,9 @@ la **primera** y se registra un `warning` (no es error).
 
 ### Buscar ítems de una lista
 
-Búsqueda con hasta 15 condiciones de igualdad combinadas con **AND**. Cada valor
-viaja en su tipo JSON natural (string, boolean sin comillas, número) y se valida
-contra el esquema real de la lista antes de consultar Graph:
+Búsqueda con hasta 15 condiciones combinadas con **AND**. Cada valor viaja en su
+tipo JSON natural (string, boolean sin comillas, número) y se valida contra el
+esquema real de la lista antes de consultar Graph:
 
 ```bash
 curl -X POST "http://localhost:8003/v1/sharepoint/list/items:search" \
@@ -154,17 +154,87 @@ curl -X POST "http://localhost:8003/v1/sharepoint/list/items:search" \
   }'
 ```
 
-- `filters` (opcional, hasta 15): condiciones `{field, value}` con nombres
+- `filters` (opcional, hasta 15): condiciones `{field, op, value}` con nombres
   **internos** de columna. Omitido o `[]` → se devuelven los primeros `top` ítems
-  sin filtrar. Campo inexistente o tipo que no corresponde a la columna → `400`
-  explícito (nunca una cláusula ignorada en silencio). Cualquier campo desconocido
-  en el body → `422`.
+  sin filtrar. Campo inexistente, operador que la columna no admite o tipo que no
+  corresponde a la columna → `400` explícito (nunca una cláusula ignorada en
+  silencio). Cualquier campo desconocido en el body → `422`.
 - **Booleanos**: se envían como `true`/`false` JSON (sin comillas). Internamente el
   conector los traduce al literal OData `1`/`0` — Graph **ignora en silencio**
   `eq true|false` sobre columnas Sí/No (devuelve todas las filas sin error); con
   `1`/`0` sí filtra (verificado empíricamente contra la lista DSL).
 - **Columnas lookup**: se filtran por su campo `{Columna}LookupId` con el ID
   numérico (p. ej. `Cliente_x002d_LIBSALookupId`); filtrar por la columna base da `400`.
+
+#### Operadores (`op`)
+
+`op` es opcional y vale `eq` por defecto, así que **cualquier body escrito para la
+v2.5.0 sigue funcionando sin cambios**. Los operadores son un conjunto cerrado:
+cualquier otro token → `422`.
+
+| `op`                | `value`                     | Columnas admitidas |
+| ------------------- | --------------------------- | ------------------ |
+| `eq`                | escalar                     | todas |
+| `in`                | array de 1–20, mismo tipo   | todas menos Sí/No |
+| `ge` `gt` `le` `lt` | escalar                     | número, moneda, fecha/hora, `{Columna}LookupId` |
+
+- **`in`** se traduce a un grupo OR de igualdades **entre paréntesis** —
+  `(fields/Estado eq 'Iniciado' or fields/Estado eq 'Pausado')` — no al operador
+  nativo `in` de OData, cuyo soporte sobre columnas de listas de SharePoint no
+  está verificado (y si no estuviera soportado, el fallo sería el peligroso:
+  cláusula descartada y `200` con todas las filas). El OR existe **solo dentro**
+  de un `in`; entre condiciones el enlace es siempre AND.
+- **`ge`/`gt`/`le`/`lt`** solo se admiten donde el orden significa algo. Sobre una
+  columna de texto o *choice* → `400` con el nombre y el tipo de la columna: OData
+  compararía lexicográficamente y el resultado parecería lo bastante plausible
+  para pasar desapercibido.
+- **`in` sobre una columna Sí/No** → `400`: con dos valores posibles, `in` es o un
+  `eq` redundante o una tautología que devuelve todas las filas.
+- **Fechas**: el valor es un instante **ISO-8601 y se interpreta en UTC tal como
+  viene** — el conector *no* le aplica la zona del tenant (a diferencia del
+  `period` del upsert, donde el conector calcula los límites y por eso necesita la
+  zona). Un valor con offset se normaliza a UTC y uno sin zona se toma como UTC:
+  `2026-06-01T00:00:00Z`, `2026-06-01T02:00:00+02:00`, `2026-06-01T00:00:00` y
+  `2026-06-01` seleccionan exactamente las mismas filas. Un valor no parseable →
+  `400` con el nombre de la columna y el formato esperado.
+- **Texto: Graph compara sin distinguir mayúsculas.** `{"field":"Entorno","value":"L02"}`
+  también devuelve las filas guardadas como `l02`. Vale igual para `eq` y para `in`, y
+  significa que un `in` no sirve para distinguir valores que solo difieren en la caja.
+- **Presupuesto de cláusulas**: tras expandir todos los `in`, el total de cláusulas
+  generadas no puede pasar de **100** → `422` indicando el número generado y el
+  límite. ⚠️ **El techo real de Graph es la longitud de la URL** (~5 KB), medido el
+  2026-09-03: caben 115 cláusulas cortas de texto, pero solo **73** de fecha y **88**
+  de lookup, y al pasarse Graph responde `404`. Con arrays `in` grandes de valores
+  largos conviene quedarse bastante por debajo de las 100.
+
+**Ejemplo — el caso que motivó los operadores.** Los ítems de
+`HistorialConsumoBolsas` en cualquiera de los tres estados abiertos, más los
+completados de los últimos 15 días. Antes: **4 llamadas + un filtrado `jq` en
+cliente**. Ahora, **2 llamadas y ningún post-filtrado**:
+
+```json
+{ "sharepoint_url": "...", "filters": [
+  { "field": "Estado", "op": "in",
+    "value": ["Para Entregar", "Iniciado", "Pausado"] }
+]}
+```
+
+```json
+{ "sharepoint_url": "...", "filters": [
+  { "field": "Estado", "value": "Completado" },
+  { "field": "FechaFinalizado", "op": "ge", "value": "2026-08-18T00:00:00Z" }
+]}
+```
+
+> **Los operadores no levantan el umbral de vista de SharePoint (~5000 filas).**
+> Al contrario: un grupo OR o una comparación sobre una columna **no indexada** es
+> justo el tipo de consulta que Graph no puede servir desde un índice, así que en
+> listas grandes es más probable ver un `notSupported` (propagado con su detalle)
+> que con un filtro de igualdad simple. Si la lista es grande, filtra por columnas
+> indexadas. `ge`/`le` sí reducen cuántas veces se topa uno con el corte de `top`,
+> porque el servidor descarta las filas fuera de rango en vez de gastar el
+> presupuesto en ellas — pero `has_more` sigue sin cursor de paginación.
+
 - `order_by` (opcional): `{ "field": "...", "direction": "asc"|"desc" }`. En listas
   que superan el **umbral de vista** de SharePoint (~5000 filas), Graph rechaza
   ordenar por columnas no indexadas (`notSupported`, error propagado con detalle);

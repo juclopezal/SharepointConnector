@@ -5,6 +5,8 @@ Se instancia el servicio sin TokenManager y se sustituyen los helpers HTTP
 (`_get`, `_put_bytes`) por dobles, de modo que no se toca la red.
 """
 
+from urllib.parse import unquote
+
 import pytest
 
 from app.core.exceptions import GraphAPIError
@@ -247,9 +249,11 @@ def test_odata_literal_int_one_is_not_bool_true():
 _DSL_COLUMNS = [
     {"name": "Title", "text": {}},
     {"name": "Entorno", "text": {}},
+    {"name": "Estado", "choice": {}},
     {"name": "_x00da_ltima", "boolean": {}},
     {"name": "Cliente_x002d_LIBSA", "lookup": {}},
     {"name": "hohl", "number": {}},
+    {"name": "FechaFinalizado", "dateTime": {}},
 ]
 
 
@@ -502,3 +506,313 @@ async def test_search_select_only_fetches_columns_once(sp):
     await sp.search_list_items("SITE", "LIST", select=["Title"])
 
     assert captured["columns_calls"] == 1
+
+
+# ----------------------------------------------------------------------
+# search_list_items — operadores (`op`): construcción de la expresión
+#
+# Las URLs se inspeccionan percent-decodificadas salvo cuando el test es
+# precisamente sobre el encoding (ver el final de la sección).
+# ----------------------------------------------------------------------
+
+
+def _filter_expr(captured) -> str:
+    """Devuelve el `$filter` de la última URL, percent-decodificado."""
+    parts = captured["urls"][-1].split("&")
+    expr = next((p[len("$filter=") :] for p in parts if p.startswith("$filter=")), None)
+    assert expr is not None, f"la URL no lleva $filter: {captured['urls'][-1]}"
+    return unquote(expr)
+
+
+async def test_search_filter_without_op_is_byte_identical_to_eq(sp):
+    # promesa de compatibilidad: un filtro de la v2.5.0 (2-tupla, sin `op`)
+    # genera exactamente la misma cláusula que su equivalente explícito
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("Entorno", "L02"), ("_x00da_ltima", True)]
+    )
+    legacy = captured["urls"][-1]
+
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE",
+        "LIST",
+        filters=[("Entorno", "eq", "L02"), ("_x00da_ltima", "eq", True)],
+    )
+
+    assert captured["urls"][-1] == legacy
+
+
+async def test_search_in_builds_parenthesised_or_group(sp):
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE",
+        "LIST",
+        filters=[("Estado", "in", ["Para Entregar", "Iniciado", "Pausado"])],
+    )
+
+    assert _filter_expr(captured) == (
+        "(fields/Estado eq 'Para Entregar' or fields/Estado eq 'Iniciado' "
+        "or fields/Estado eq 'Pausado')"
+    )
+
+
+async def test_search_in_single_element_is_still_parenthesised(sp):
+    # la forma generada no depende de la longitud del array
+    captured = _wire_search(sp)
+    await sp.search_list_items("SITE", "LIST", filters=[("Estado", "in", ["Pausado"])])
+
+    assert _filter_expr(captured) == "(fields/Estado eq 'Pausado')"
+
+
+async def test_search_in_escapes_quotes_in_each_element(sp):
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("Title", "in", ["O'Hara", "Smith"])]
+    )
+
+    assert _filter_expr(captured) == (
+        "(fields/Title eq 'O''Hara' or fields/Title eq 'Smith')"
+    )
+
+
+async def test_search_in_numeric_elements_unquoted(sp):
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("Cliente_x002d_LIBSALookupId", "in", [35, 41])]
+    )
+
+    assert _filter_expr(captured) == (
+        "(fields/Cliente_x002d_LIBSALookupId eq 35 "
+        "or fields/Cliente_x002d_LIBSALookupId eq 41)"
+    )
+
+
+async def test_search_in_combined_with_second_filter_keeps_precedence(sp):
+    # sin los paréntesis, el `or` absorbería el `and` y la expresión cambiaría
+    # de significado: es la garantía que este test protege
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE",
+        "LIST",
+        filters=[("Estado", "in", ["Iniciado", "Pausado"]), ("Entorno", "eq", "L02")],
+    )
+
+    assert _filter_expr(captured) == (
+        "(fields/Estado eq 'Iniciado' or fields/Estado eq 'Pausado') "
+        "and fields/Entorno eq 'L02'"
+    )
+
+
+@pytest.mark.parametrize("op", ["ge", "gt", "le", "lt"])
+async def test_search_comparison_clause_on_numeric_column(sp, op):
+    captured = _wire_search(sp)
+    await sp.search_list_items("SITE", "LIST", filters=[("hohl", op, 10)])
+
+    assert _filter_expr(captured) == f"fields/hohl {op} 10"
+
+
+@pytest.mark.parametrize("op", ["ge", "gt", "le", "lt"])
+async def test_search_comparison_clause_on_lookup_id(sp, op):
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("Cliente_x002d_LIBSALookupId", op, 10)]
+    )
+
+    assert _filter_expr(captured) == f"fields/Cliente_x002d_LIBSALookupId {op} 10"
+
+
+async def test_search_datetime_comparison_literal_is_quoted(sp):
+    # el literal ENTRECOMILLADO es el que Graph evalúa sobre columnas de fecha de
+    # listas de SharePoint: medido el 2026-09-03 contra la lista DSL real, donde
+    # el `dateTimeOffset` desnudo que pide OData 4.0 da 400 invalidRequest y el
+    # entrecomillado parte la lista exactamente (ge 9.127 + lt 193 = 9.320 filas)
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE",
+        "LIST",
+        filters=[
+            ("FechaFinalizado", "ge", "2026-08-18T00:00:00Z"),
+            ("FechaFinalizado", "lt", "2026-09-02T00:00:00Z"),
+        ],
+    )
+
+    assert _filter_expr(captured) == (
+        "fields/FechaFinalizado ge '2026-08-18T00:00:00Z' "
+        "and fields/FechaFinalizado lt '2026-09-02T00:00:00Z'"
+    )
+
+
+async def test_search_datetime_in_group_literals_quoted(sp):
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE",
+        "LIST",
+        filters=[
+            ("FechaFinalizado", "in", ["2026-08-18T00:00:00Z", "2026-08-19T00:00:00Z"])
+        ],
+    )
+
+    assert _filter_expr(captured) == (
+        "(fields/FechaFinalizado eq '2026-08-18T00:00:00Z' "
+        "or fields/FechaFinalizado eq '2026-08-19T00:00:00Z')"
+    )
+
+
+async def test_search_datetime_eq_unchanged_from_v250(sp):
+    # `eq` conserva la traducción dirigida por el valor de la v2.5.0. Coincide con
+    # la de los operadores nuevos para un instante bien formado —ambas
+    # entrecomilladas— pero NO valida el valor como ISO-8601, para no cambiar el
+    # comportamiento de un body existente. La verificación empírica del
+    # 2026-09-03 confirmó que este `eq` ya filtraba bien: sin defecto que
+    # arrastrar.
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("FechaFinalizado", "eq", "2026-08-18T00:00:00Z")]
+    )
+    assert _filter_expr(captured) == "fields/FechaFinalizado eq '2026-08-18T00:00:00Z'"
+
+    # un valor libre sigue pasando con `eq`, como en la v2.5.0
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("FechaFinalizado", "eq", "cualquier cosa")]
+    )
+    assert _filter_expr(captured) == "fields/FechaFinalizado eq 'cualquier cosa'"
+
+
+@pytest.mark.parametrize(
+    ("given", "emitted"),
+    [
+        ("2026-08-18T00:00:00Z", "2026-08-18T00:00:00Z"),
+        ("2026-08-18T02:00:00+02:00", "2026-08-18T00:00:00Z"),  # normalizado a UTC
+        ("2026-08-18T00:00:00", "2026-08-18T00:00:00Z"),  # sin zona → UTC tal cual
+        ("2026-08-18", "2026-08-18T00:00:00Z"),  # solo fecha → medianoche UTC
+        ("2026-08-18T00:00:00.123456Z", "2026-08-18T00:00:00.123456Z"),
+    ],
+)
+async def test_search_datetime_literal_reemitted_canonically(sp, given, emitted):
+    # el instante se reemite a partir del valor parseado: lo que se interpola en
+    # la expresión nunca es texto del caller
+    captured = _wire_search(sp)
+    await sp.search_list_items("SITE", "LIST", filters=[("FechaFinalizado", "ge", given)])
+
+    assert _filter_expr(captured) == f"fields/FechaFinalizado ge '{emitted}'"
+
+
+@pytest.mark.parametrize("bad_date", ["18/08/2026", "last week", "2026-13-01", "", "ayer"])
+async def test_search_malformed_date_rejected_naming_column_and_format(sp, bad_date):
+    captured = _wire_search(sp)
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.search_list_items(
+            "SITE", "LIST", filters=[("FechaFinalizado", "ge", bad_date)]
+        )
+
+    assert exc.value.status_code == 400
+    assert "FechaFinalizado" in exc.value.message
+    assert "ISO-8601" in exc.value.message
+    # rechazado antes de llamar a Graph: solo se pidió el esquema de columnas
+    assert all("/items?" not in u for u in captured["urls"])
+
+
+@pytest.mark.parametrize("op", ["ge", "gt", "le", "lt"])
+@pytest.mark.parametrize("field", ["Title", "Estado"])
+async def test_search_ordering_on_text_or_choice_rejected(sp, op, field):
+    # OData compararía lexicográficamente y el resultado parecería plausible
+    _wire_search(sp)
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.search_list_items("SITE", "LIST", filters=[(field, op, "Iniciado")])
+
+    assert exc.value.status_code == 400
+    assert field in exc.value.message
+    assert "eq, in" in exc.value.message
+
+
+async def test_search_in_on_boolean_column_rejected(sp):
+    # dominio de dos valores: `in` sería un `eq` redundante o una tautología
+    _wire_search(sp)
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.search_list_items(
+            "SITE", "LIST", filters=[("_x00da_ltima", "in", [True, False])]
+        )
+
+    assert exc.value.status_code == 400
+    assert "_x00da_ltima" in exc.value.message
+    assert "solo admite eq" in exc.value.message
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        [("Estado", "in", ["Iniciado", "Pausado"])],
+        [("Title", "in", ["a", "b"])],
+        [("hohl", "ge", 10)],
+        [("FechaFinalizado", "le", "2026-09-02T00:00:00Z")],
+        [("Cliente_x002d_LIBSALookupId", "gt", 3)],
+        [("Cliente_x002d_LIBSALookupId", "in", [35, 41])],
+        [("_x00da_ltima", "eq", True)],
+    ],
+)
+async def test_search_supported_operator_column_combinations_accepted(sp, filters):
+    captured = _wire_search(sp)
+    await sp.search_list_items("SITE", "LIST", filters=filters)
+
+    assert any("/items?" in u for u in captured["urls"])
+
+
+async def test_search_one_badly_typed_in_element_rejects_whole_filter(sp):
+    captured = _wire_search(sp)
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.search_list_items(
+            "SITE", "LIST", filters=[("Cliente_x002d_LIBSALookupId", "in", [35, "41"])]
+        )
+
+    assert exc.value.status_code == 400
+    assert "Cliente_x002d_LIBSALookupId" in exc.value.message
+    # ni un filtro parcialmente aplicado llega a Graph
+    assert all("/items?" not in u for u in captured["urls"])
+
+
+async def test_search_invalid_op_rejected_in_service(sp):
+    # revalidación en el servicio (defensa en profundidad): el enum del schema
+    # ya lo acota, pero el operador no se interpola sin comprobarse aquí
+    _wire_search(sp)
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.search_list_items(
+            "SITE", "LIST", filters=[("Entorno", "eq 1 or 1", "L02")]
+        )
+
+    assert exc.value.status_code == 400
+
+
+async def test_search_operator_validation_reuses_cached_columns(sp):
+    # validar operadores no cuesta una segunda llamada a GET .../columns
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("Estado", "in", ["Iniciado", "Pausado"])]
+    )
+    await sp.search_list_items("SITE", "LIST", filters=[("hohl", "ge", 10)])
+    await sp.search_list_items(
+        "SITE", "LIST", filters=[("FechaFinalizado", "le", "2026-09-02T00:00:00Z")]
+    )
+
+    assert captured["columns_calls"] == 1
+
+
+async def test_search_whole_expression_percent_encoded_as_one_unit(sp):
+    # paréntesis, espacios y comillas incluidos: nada se deja sin encodear
+    # asumiendo que Graph lo tolera
+    captured = _wire_search(sp)
+    await sp.search_list_items(
+        "SITE",
+        "LIST",
+        filters=[("Estado", "in", ["Iniciado", "Pausado"]), ("Entorno", "eq", "L02")],
+    )
+
+    url = captured["urls"][-1]
+    assert (
+        "$filter=%28fields%2FEstado%20eq%20%27Iniciado%27%20or%20"
+        "fields%2FEstado%20eq%20%27Pausado%27%29%20and%20"
+        "fields%2FEntorno%20eq%20%27L02%27" in url
+    )
+    raw = url.split("$filter=")[1].split("&")[0]
+    assert not any(c in raw for c in "() '")

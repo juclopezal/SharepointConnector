@@ -248,13 +248,53 @@ async def search_list_items_by_url(
 ):
     """Busca ítems de la lista identificada por `sharepoint_url`.
 
-    Filtros (`filters`, opcional, hasta 15): condiciones `{field, value}` de
-    igualdad combinadas con **AND**. Cada condición se valida contra el esquema
-    real de la lista: campo inexistente o tipo que no corresponde a la columna →
-    `400` explícito (nunca una cláusula ignorada en silencio). El `value` viaja
-    en su tipo JSON natural — los booleanos como `true`/`false` sin comillas —
-    y el conector lo traduce internamente al literal OData correcto. Sin
-    `filters` (u `[]`), se devuelven los primeros `top` ítems.
+    Filtros (`filters`, opcional, hasta 15): condiciones `{field, op, value}`
+    combinadas con **AND**. Cada condición se valida contra el esquema real de
+    la lista: campo inexistente, operador que la columna no admite o tipo que no
+    corresponde a la columna → `400` explícito (nunca una cláusula ignorada en
+    silencio). El `value` viaja en su tipo JSON natural — los booleanos como
+    `true`/`false` sin comillas — y el conector lo traduce internamente al
+    literal OData correcto. Sin `filters` (u `[]`), se devuelven los primeros
+    `top` ítems.
+
+    `op` (opcional, `eq` por defecto) elige el operador de la condición:
+
+    | `op`                 | `value`                  | Columnas admitidas |
+    | -------------------- | ------------------------ | ------------------ |
+    | `eq`                 | escalar                  | todas |
+    | `in`                 | array de 1–20, mismo tipo | todas menos Sí/No |
+    | `ge` `gt` `le` `lt`  | escalar                  | número, moneda, fecha/hora, `{Columna}LookupId` |
+
+    El OR solo existe **dentro** de un `in`, que se expande a un grupo de
+    igualdades entre paréntesis; entre condiciones el enlace es siempre AND.
+    Ejemplo — «los abiertos de L02, o los cerrados de los últimos 15 días» en
+    dos llamadas en vez de cuatro:
+
+    ```json
+    {"sharepoint_url": "...", "filters": [
+      {"field": "Estado", "op": "in",
+       "value": ["Para Entregar", "Iniciado", "Pausado"]},
+      {"field": "Entorno", "value": "L02"}
+    ]}
+    ```
+
+    ```json
+    {"sharepoint_url": "...", "filters": [
+      {"field": "Estado", "value": "Completado"},
+      {"field": "FechaFinalizado", "op": "ge", "value": "2026-08-18T00:00:00Z"},
+      {"field": "FechaFinalizado", "op": "lt", "value": "2026-09-02T00:00:00Z"}
+    ]}
+    ```
+
+    Las comparaciones sobre columnas de fecha/hora esperan un instante ISO-8601
+    y lo interpretan **en UTC tal como viene** (el conector no le aplica la zona
+    del tenant, a diferencia del `period` del upsert). Un valor no parseable →
+    `400`. Tras expandir los `in`, el total de cláusulas generadas no puede
+    pasar de 100 (`422`).
+
+    Estos operadores **no** levantan el umbral de vista de SharePoint (~5000
+    filas): un grupo OR o una comparación sobre una columna no indexada es
+    candidato a que Graph responda `notSupported`, que se propaga con su detalle.
 
     Las columnas lookup se filtran por su campo `{Columna}LookupId` con el ID
     numérico del elemento referenciado.
@@ -275,16 +315,17 @@ async def search_list_items_by_url(
     0 coincidencias → `200` con `total: 0`.
     """
     logger.info(
-        "search_list_items_by_url → url=%r filters=%d order_by=%r top=%d",
+        "search_list_items_by_url → url=%r filters=%d ops=%r order_by=%r top=%d",
         payload.sharepoint_url,
         len(payload.filters or []),
+        [f.op for f in (payload.filters or [])],
         (payload.order_by.field, payload.order_by.direction)
         if payload.order_by
         else None,
         payload.top,
     )
     resolved = await resolver.resolve_list(payload.sharepoint_url)
-    filters = [(f.field, f.value) for f in (payload.filters or [])]
+    filters = [(f.field, f.op, f.value) for f in (payload.filters or [])]
     order_by = (
         (payload.order_by.field, payload.order_by.direction)
         if payload.order_by

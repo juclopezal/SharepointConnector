@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
@@ -27,6 +28,24 @@ _COLUMNS_CACHE_TTL = 300.0
 # numérico que NO aparece como columna propia en GET .../columns).
 _LOOKUP_ID_SUFFIX = "LookupId"
 
+# Operadores admitidos en un filtro de búsqueda. Debe coincidir con el Literal
+# de `SearchFilter.op`: se revalida aquí (defensa en profundidad, igual que el
+# nombre de campo) antes de interpolar el operador en la expresión.
+_SEARCH_OPS = frozenset({"eq", "in", "ge", "gt", "le", "lt"})
+
+# Operadores de orden. Solo se admiten sobre columnas comparables: sobre texto o
+# choice OData compararía lexicográficamente, y el resultado parecería lo
+# bastante plausible para pasar desapercibido.
+_ORDERING_OPS = frozenset({"ge", "gt", "le", "lt"})
+
+# Familias de tipo de columna que admiten los operadores de orden.
+_ORDERABLE_FAMILIES = frozenset({"number", "dateTime", "lookupId"})
+
+# Un filtro llega al servicio como `(field, value)` — equivalente a `eq`, la
+# forma anterior a la v2.6.0 — o como `(field, op, value)`.
+_SearchValue = str | bool | int | float | list[str | bool | int | float]
+_SearchFilterSpec = tuple[str, _SearchValue] | tuple[str, str, _SearchValue]
+
 
 def _to_odata_literal(value: "str | bool | int | float") -> str:
     """Traduce un valor JSON al literal OData que Graph evalúa correctamente.
@@ -36,6 +55,11 @@ def _to_odata_literal(value: "str | bool | int | float") -> str:
     sobre columnas Sí/No de SharePoint — devuelve todas las filas como si la
     condición no existiera, sin error. ``eq 1``/``eq 0`` sí filtra (verificado
     empíricamente contra la lista DSL el 2026-07-22).
+
+    Traducción dirigida por el valor. Las columnas de fecha/hora son la única
+    excepción y no pasan por aquí: necesitan un literal SIN comillas que solo
+    puede decidirse conociendo el tipo de la columna (ver
+    :func:`_to_odata_datetime_literal`).
     """
     if isinstance(value, bool):  # antes que int/float: bool es subclase de int
         return "1" if value else "0"
@@ -44,16 +68,78 @@ def _to_odata_literal(value: "str | bool | int | float") -> str:
     return str(value)
 
 
+def _to_odata_datetime_literal(field: str, value: "str | bool | int | float") -> str:
+    """Literal de una comparación contra una columna de fecha: instante canónico
+    ENTRECOMILLADO.
+
+    Las comillas son las que funcionan, **verificado empíricamente** contra la
+    lista DSL real el 2026-09-03 (columna `Modified`, 9.320 filas):
+
+    - ``fields/Modified ge 2018-01-01T00:00:00Z`` (literal `dateTimeOffset`
+      desnudo, lo que pide OData 4.0) → Graph responde **400 invalidRequest**.
+      Igual con milisegundos, con offset ``+00:00``, solo fecha, y con
+      ``datetime'...'`` de OData v3.
+    - ``fields/Modified ge '2018-01-01T00:00:00Z'`` → **200 y filtra de verdad**:
+      9.127 filas, mínimo devuelto 2018-02-15; el ``lt`` complementario devuelve
+      193 filas con máximo 2017-07-28, y 9.127 + 193 = 9.320 = el total exacto de
+      la lista. La partición perfecta prueba que la cláusula se evalúa, no que
+      simplemente no dé error.
+
+    Es decir: aquí Graph se comporta al contrario de lo que se supuso al diseñar
+    el cambio, y al revés que con los booleanos (donde el literal desnudo
+    ``1``/``0`` es el que filtra y el entrecomillado el que se ignora). Precedente
+    que conviene recordar: sobre columnas de listas de SharePoint, la forma del
+    literal se decide midiendo, no leyendo la especificación.
+
+    Lo que esta función sigue aportando sobre el entrecomillado genérico de
+    :func:`_to_odata_literal` es la **validación** del valor como instante
+    ISO-8601 (un ``"18/08/2026"`` es un 400 explícito en vez de una cláusula que
+    no puede coincidir con nada) y su **canonicalización a UTC**: el instante se
+    reemite a partir del valor parseado, no se copia tal cual, así que lo que se
+    interpola nunca es texto del caller. Un valor sin zona se interpreta **en UTC
+    tal como viene** y uno con offset se normaliza a UTC — el conector no aplica
+    ``TENANT_TIMEZONE``, a diferencia del ``period`` del upsert (allí el conector
+    calcula los límites, así que necesita la zona; aquí el caller da el instante y
+    desplazarlo en silencio haría que el mismo string señalara filas distintas en
+    cada despliegue).
+    """
+    raw = str(value).strip()
+    candidate = raw[:-1] + "+00:00" if raw[-1:] in ("Z", "z") else raw
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        raise GraphAPIError(
+            400,
+            f"Valor de fecha inválido para el campo '{field}': {value!r}. La "
+            "columna es de fecha/hora y espera un instante ISO-8601 en UTC, "
+            "p. ej. '2026-08-18T00:00:00Z'.",
+        ) from None
+    parsed = (
+        parsed.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None
+        else parsed.astimezone(timezone.utc)
+    )
+    if parsed.microsecond:
+        return "'" + parsed.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z'"
+    return "'" + parsed.strftime("%Y-%m-%dT%H:%M:%SZ") + "'"
+
+
 def _search_field_expected_type(
     columns: list[dict], field: str
-) -> "tuple[type | tuple[type, ...], str]":
+) -> "tuple[type | tuple[type, ...], str, str]":
     """Resuelve ``field`` contra las columnas reales de la lista.
 
-    Devuelve ``(tipos python aceptados, etiqueta del tipo esperado)`` o lanza
-    ``GraphAPIError(400)`` si el campo no existe o es una columna lookup
+    Devuelve ``(tipos python aceptados, etiqueta del tipo esperado, familia)`` o
+    lanza ``GraphAPIError(400)`` si el campo no existe o es una columna lookup
     referenciada sin el sufijo ``LookupId`` (Graph no filtra de forma fiable
     por la columna lookup base; aceptarla reintroduciría el fallo silencioso
     que este endpoint existe para eliminar).
+
+    La *familia* (``boolean``, ``number``, ``dateTime``, ``lookupId``, ``text``)
+    es lo que decide qué operadores admite la columna
+    (:func:`_check_search_operator`) y si el literal se emite entrecomillado.
+    Cualquier tipo no reconocido cae en ``text``, la más restrictiva de las
+    familias que admiten ``in``.
     """
     by_name = {c.get("name"): c for c in columns}
 
@@ -67,20 +153,63 @@ def _search_field_expected_type(
                 "ID numérico del elemento referenciado.",
             )
         if "boolean" in col:
-            return bool, "boolean (true/false, sin comillas)"
+            return bool, "boolean (true/false, sin comillas)", "boolean"
         if "number" in col or "currency" in col:
-            return (int, float), "number"
-        return str, "string"
+            return (int, float), "number", "number"
+        if "dateTime" in col:
+            return str, "string ISO-8601 UTC ('2026-08-18T00:00:00Z')", "dateTime"
+        return str, "string", "text"
 
     if field.endswith(_LOOKUP_ID_SUFFIX):
         base = by_name.get(field[: -len(_LOOKUP_ID_SUFFIX)])
         if base is not None and "lookup" in base:
-            return int, "integer (LookupId)"
+            return int, "integer (LookupId)", "lookupId"
 
     raise GraphAPIError(
         400,
         f"El campo '{field}' no existe en la lista. Debe ser el nombre interno "
         "de una columna existente.",
+    )
+
+
+def _supported_search_ops(family: str) -> tuple[str, ...]:
+    """Operadores que admite una familia de columna (matriz de la decisión 4)."""
+    if family == "boolean":
+        return ("eq",)
+    if family in _ORDERABLE_FAMILIES:
+        return ("eq", "in", "ge", "gt", "le", "lt")
+    return ("eq", "in")
+
+
+def _check_search_operator(field: str, op: str, family: str, label: str) -> None:
+    """Exige que la columna real admita el operador pedido, o 400 explícito.
+
+    Tercera pregunta de la validación contra el esquema, junto a «¿existe la
+    columna?» y «¿corresponde el tipo del valor?». Rechazar es barato; una
+    respuesta equivocada que parece correcta no lo es.
+    """
+    allowed = _supported_search_ops(family)
+    if op in allowed:
+        return
+    if op == "in" and family == "boolean":
+        detail = (
+            " Una columna Sí/No tiene dos valores, así que 'in' sería un 'eq' "
+            "redundante o una tautología que devuelve todas las filas; fíltrala "
+            "con 'eq' y el booleano correspondiente."
+        )
+    elif op in _ORDERING_OPS:
+        detail = (
+            " Los operadores de orden solo se admiten sobre columnas numéricas, "
+            "de moneda, de fecha/hora y '{Columna}LookupId': sobre texto o "
+            "choice OData compararía lexicográficamente, que casi nunca es lo "
+            "que se pide."
+        )
+    else:  # pragma: no cover - `op` viene de un enum cerrado
+        detail = ""
+    raise GraphAPIError(
+        400,
+        f"El operador '{op}' no se admite para el campo '{field}': la columna "
+        f"espera {label} y solo admite {', '.join(allowed)}.{detail}",
     )
 
 
@@ -129,6 +258,75 @@ def _check_search_value_type(
             f"Tipo inválido para el campo '{field}': la columna espera {label} "
             f"y se recibió {type(value).__name__} ({value!r}).",
         )
+
+
+def _normalize_search_filter(spec: "_SearchFilterSpec") -> "tuple[str, str, _SearchValue]":
+    """Normaliza un filtro a ``(field, op, value)``.
+
+    La forma de dos elementos ``(field, value)`` es la de antes de la v2.6.0 y
+    equivale a ``eq``: se sigue aceptando para que un llamador escrito contra la
+    firma anterior genere exactamente la misma cláusula.
+    """
+    if len(spec) == 2:
+        field, value = spec
+        return field, "eq", value
+    field, op, value = spec
+    return field, op, value
+
+
+def _search_literal(
+    field: str, value: "str | bool | int | float", family: str, op: str
+) -> str:
+    """Literal OData de un valor ya validado contra el tipo de su columna.
+
+    Sobre una columna de fecha, los operadores **nuevos** de la v2.6.0 (``in``,
+    ``ge``, ``gt``, ``le``, ``lt``) pasan por
+    :func:`_to_odata_datetime_literal`, que **valida** el valor como instante
+    ISO-8601 y lo **canonicaliza a UTC**. ``eq`` mantiene intacta la traducción
+    dirigida por el valor de la v2.5.0, sin esa validación, para no cambiar el
+    comportamiento de un body existente.
+
+    Ambos caminos emiten el instante **entrecomillado**: es la forma que Graph
+    evalúa (medido el 2026-09-03; ver la función citada). La verificación empírica
+    confirmó además que ``eq`` sobre columna de fecha ya filtraba correctamente
+    antes de este cambio — no había defecto preexistente que arrastrar.
+    """
+    if family == "dateTime" and op != "eq":
+        return _to_odata_datetime_literal(field, value)
+    return _to_odata_literal(value)
+
+
+def _build_search_clause(
+    field: str, op: str, value: "_SearchValue", family: str
+) -> str:
+    """Cláusula OData de un filtro ya validado (campo, operador y tipos).
+
+    Con ``in`` el operador OData de cada igualdad es ``eq``, pero el literal se
+    emite con las reglas del operador del filtro (``in``), no con las de ``eq``:
+    sobre una columna de fecha/hora eso significa el instante sin comillas.
+
+    ``in`` no se emite con el operador nativo de OData: su comportamiento contra
+    ``fields/{columna}`` en listas de SharePoint no está verificado por el
+    proyecto, y el modo de fallo si no está soportado es el peligroso — cláusula
+    descartada y ``200`` con todas las filas. Se expande a un grupo OR de
+    igualdades, que es el único operador probado sobre estas columnas.
+
+    Los paréntesis son obligatorios, no cosméticos: sin ellos la precedencia
+    entre ``or`` y el ``and`` que une los filtros cambiaría el significado de
+    toda la expresión. Un array de un solo elemento también va entre paréntesis,
+    para que la forma generada no dependa de su longitud.
+    """
+    if op == "in":
+        assert isinstance(value, list)  # garantizado por el schema
+        return (
+            "("
+            + " or ".join(
+                f"fields/{field} eq {_search_literal(field, element, family, op)}"
+                for element in value
+            )
+            + ")"
+        )
+    return f"fields/{field} {op} {_search_literal(field, value, family, op)}"
 
 
 def _encode_drive_path(folder: str, filename: str) -> str:
@@ -499,19 +697,29 @@ class SharePointService:
         site_id: str,
         list_id: str,
         *,
-        filters: "list[tuple[str, str | bool | int | float]] | None" = None,
+        filters: "list[_SearchFilterSpec] | None" = None,
         order_by: "tuple[str, str] | None" = None,
         select: "list[str] | None" = None,
         top: int = 100,
     ) -> tuple[list[dict], bool]:
-        """Busca ítems con 0..N condiciones de igualdad combinadas con ``and``.
+        """Busca ítems con 0..N condiciones combinadas con ``and``.
+
+        Cada condición es ``(field, op, value)`` — o ``(field, value)``, la forma
+        anterior a la v2.6.0, equivalente a ``eq``. ``op`` es uno de ``eq``,
+        ``in``, ``ge``, ``gt``, ``le`` o ``lt``; el OR solo existe *dentro* de un
+        ``in``, mientras que el enlace *entre* condiciones es siempre ``and``.
 
         Cada condición se valida contra el esquema real de la lista (columnas
         vía :meth:`get_list_columns`) antes de construir el ``$filter``: campo
-        inexistente o tipo JSON que no corresponde al de la columna → 400
-        explícito, nunca una cláusula descartada en silencio por Graph. Los
-        valores se traducen a literal OData según su tipo (booleano → ``1``/``0``,
-        ver :func:`_to_odata_literal`).
+        inexistente, operador que la columna no admite o tipo JSON que no
+        corresponde al de la columna → 400 explícito, nunca una cláusula
+        descartada en silencio por Graph. Con ``in`` el tipo se comprueba en
+        **cada** elemento del array, y uno mal tipado rechaza el filtro entero.
+        Los valores se traducen a literal OData según su tipo (booleano →
+        ``1``/``0``, ver :func:`_to_odata_literal`), salvo las columnas de
+        fecha/hora con un operador nuevo de la v2.6.0, cuyo literal se emite sin
+        comillas y en UTC tal como viene (ver :func:`_to_odata_datetime_literal`);
+        ``eq`` conserva la traducción de la v2.5.0 también en esas columnas.
 
         ``top`` acota el número de ítems devueltos siguiendo la paginación de
         Graph (:meth:`_get_bounded`); ``order_by`` añade ``$orderby`` y, si la
@@ -529,16 +737,28 @@ class SharePointService:
 
         clauses: list[str] = []
         if filters:
-            for field, value in filters:
+            for spec in filters:
+                field, op, value = _normalize_search_filter(spec)
+                # Revalidación en el servicio (defensa en profundidad): ni el
+                # nombre de campo ni el operador se interpolan sin comprobarse
+                # aquí, aunque el schema ya los haya acotado.
                 if not _FIELD_NAME_RE.match(field):
                     raise GraphAPIError(
                         400,
                         f"Nombre de campo inválido: {field!r}. Debe ser el nombre "
                         "interno de la columna (solo letras, dígitos y '_').",
                     )
-                expected, label = _search_field_expected_type(columns, field)
-                _check_search_value_type(field, value, expected, label)
-                clauses.append(f"fields/{field} eq {_to_odata_literal(value)}")
+                if op not in _SEARCH_OPS:
+                    raise GraphAPIError(
+                        400,
+                        f"Operador de filtro inválido: {op!r}. Debe ser uno de "
+                        f"{', '.join(sorted(_SEARCH_OPS))}.",
+                    )
+                expected, label, family = _search_field_expected_type(columns, field)
+                _check_search_operator(field, op, family, label)
+                for element in value if isinstance(value, list) else [value]:
+                    _check_search_value_type(field, element, expected, label)
+                clauses.append(_build_search_clause(field, op, value, family))
 
         if select:
             for name in select:

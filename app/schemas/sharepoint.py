@@ -7,6 +7,33 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # Nombre interno de columna: mismo patrón anti-inyección que los campos de filtro.
 _ColumnName = Annotated[str, Field(pattern=r"^[A-Za-z0-9_]+$")]
 
+# Operadores admitidos en un filtro de búsqueda. Enum CERRADO a propósito: es la
+# segunda mitad de la garantía anti-inyección (la primera es el patrón de
+# `field`), de modo que ningún token del caller llega a la expresión OData.
+_SearchOp = Literal["eq", "in", "ge", "gt", "le", "lt"]
+
+# Máximo de valores de un `op: "in"`. Acota la longitud del $filter generado.
+_IN_MAX_VALUES = 20
+
+# Presupuesto total de cláusulas generadas tras expandir los `in` de todos los
+# filtros. Margen de seguridad frente al límite de longitud de URL de Graph (no
+# caracterizado por el proyecto), no un umbral medido.
+_MAX_GENERATED_CLAUSES = 100
+
+
+def _json_type_family(value: "str | bool | int | float") -> str:
+    """Familia de tipo JSON del valor, para exigir arrays homogéneos en ``in``.
+
+    ``bool`` se comprueba antes que ``int`` porque es subclase suya: ``[true, 1]``
+    es un array mixto, no uno válido. ``int`` y ``float`` comparten familia —
+    JSON tiene un único tipo numérico y las columnas numéricas aceptan ambos.
+    """
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "string"
+
 
 class ListItemByUrlRequest(BaseModel):
     sharepoint_url: str = Field(
@@ -173,7 +200,14 @@ class UpsertListItemResponse(BaseModel):
 
 
 class SearchFilter(BaseModel):
-    """Una condición de igualdad ``campo = valor`` de la búsqueda de ítems."""
+    """Una condición ``campo <op> valor`` de la búsqueda de ítems.
+
+    ``op`` es un enum cerrado: el operador que llega al constructor de la
+    expresión OData solo puede ser uno de seis tokens conocidos, así que ningún
+    texto del caller puede colarse en el ``$filter``. Junto con el patrón
+    anti-inyección de ``field``, todo lo que se interpola salvo el literal
+    proviene de un alfabeto finito.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -186,15 +220,66 @@ class SearchFilter(BaseModel):
             "'{Columna}LookupId' (valor entero)."
         ),
     )
-    value: str | bool | int | float = Field(
-        ...,
+    op: _SearchOp = Field(
+        default="eq",
         description=(
-            "Valor exacto a comparar, en su tipo JSON natural: string, boolean "
-            "(true/false, sin comillas), entero o decimal. El conector traduce el "
-            "valor al literal OData correcto; el tipo debe corresponder al de la "
-            "columna (se valida contra el esquema real de la lista)."
+            "Operador de comparación. 'eq' (por defecto): igualdad. 'in': "
+            "pertenencia a una lista de valores — requiere `value` como array de "
+            "1–20 elementos del mismo tipo y se expande a un grupo OR entre "
+            "paréntesis. 'ge'/'gt'/'le'/'lt': comparaciones de orden, admitidas "
+            "solo contra columnas numéricas, de moneda, de fecha/hora y "
+            "'{Columna}LookupId' (contra texto, choice o Sí/No → 400). 'in' no se "
+            "admite contra columnas Sí/No."
         ),
     )
+    value: "str | bool | int | float | list[str | bool | int | float]" = Field(
+        ...,
+        description=(
+            "Valor a comparar, en su tipo JSON natural: string, boolean "
+            "(true/false, sin comillas), entero o decimal. Con `op: \"in\"` es un "
+            "array de 1 a 20 valores del mismo tipo; con cualquier otro operador "
+            "debe ser un escalar. El conector traduce el valor al literal OData "
+            "correcto; el tipo debe corresponder al de la columna (se valida "
+            "contra el esquema real de la lista). Las columnas de fecha/hora "
+            "esperan un instante ISO-8601 en UTC, p. ej. '2026-08-18T00:00:00Z'."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _op_and_value_shape_agree(self) -> "SearchFilter":
+        """Exige que la forma de ``value`` concuerde con ``op`` (422).
+
+        Frontera 422/400 del endpoint: aquí se rechaza lo que puede juzgarse solo
+        con el body; que la columna real admita el operador y el tipo se valida
+        después, en el servicio, contra el esquema de la lista.
+        """
+        if self.op == "in":
+            if not isinstance(self.value, list):
+                raise ValueError(
+                    '`op: "in"` requiere que `value` sea un array de valores.'
+                )
+            if not 1 <= len(self.value) <= _IN_MAX_VALUES:
+                raise ValueError(
+                    f'`op: "in"` admite entre 1 y {_IN_MAX_VALUES} valores; se '
+                    f"recibieron {len(self.value)}."
+                )
+            families = {_json_type_family(v) for v in self.value}
+            if len(families) > 1:
+                raise ValueError(
+                    'Los valores de `op: "in"` deben ser todos del mismo tipo '
+                    f"JSON; se mezclaron: {', '.join(sorted(families))}."
+                )
+        elif isinstance(self.value, list):
+            raise ValueError(
+                '`value` solo puede ser un array con `op: "in"`; con '
+                f'`op: "{self.op}"` debe ser un escalar.'
+            )
+        return self
+
+    @property
+    def clause_count(self) -> int:
+        """Cláusulas OData que genera este filtro (un ``in`` genera una por valor)."""
+        return len(self.value) if isinstance(self.value, list) else 1
 
 
 class OrderBy(BaseModel):
@@ -238,7 +323,10 @@ class ListItemsSearchByUrlRequest(BaseModel):
         max_length=15,
         description=(
             "Hasta 15 condiciones combinadas con AND. Omitido o vacío → se "
-            "devuelven los primeros `top` ítems sin filtrar."
+            "devuelven los primeros `top` ítems sin filtrar. El OR solo existe "
+            'dentro de una condición `op: "in"`; entre condiciones el enlace es '
+            "siempre AND. Tras expandir los `in`, el total de cláusulas "
+            "generadas no puede pasar de 100."
         ),
     )
     order_by: OrderBy | None = Field(
@@ -265,6 +353,24 @@ class ListItemsSearchByUrlRequest(BaseModel):
             "paginación de Graph hasta reunirlos y trunca el excedente."
         ),
     )
+
+    @model_validator(mode="after")
+    def _clause_budget_not_exceeded(self) -> "ListItemsSearchByUrlRequest":
+        """Acota las cláusulas generadas tras expandir los ``in`` (422).
+
+        El tope de 15 filtros no basta: 15 filtros ``in`` de 20 valores generarían
+        300 cláusulas y un ``$filter`` que Graph podría rechazar por longitud de
+        URL. El presupuesto se comprueba aquí, sobre el body, antes de resolver la
+        lista.
+        """
+        generated = sum(f.clause_count for f in (self.filters or []))
+        if generated > _MAX_GENERATED_CLAUSES:
+            raise ValueError(
+                f"Los filtros generan {generated} cláusulas OData y el máximo es "
+                f"{_MAX_GENERATED_CLAUSES}. Reduce el número de filtros o de "
+                'valores en los `op: "in"`.'
+            )
+        return self
 
 
 class ListItemsSearchByUrlItem(BaseModel):

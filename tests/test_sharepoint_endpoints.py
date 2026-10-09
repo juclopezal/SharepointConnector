@@ -495,9 +495,13 @@ def test_search_round_trip(wired_client):
         "site_id": "SITE",
         "list_id": "LIST",
     }
-    # los filtros llegan al servicio tipados: el booleano sigue siendo bool
-    assert received["filters"] == [("Entorno", "L02"), ("_x00da_ltima", True)]
-    assert isinstance(received["filters"][1][1], bool)
+    # los filtros llegan al servicio como (field, op, value), con el `op` por
+    # defecto resuelto y tipados: el booleano sigue siendo bool
+    assert received["filters"] == [
+        ("Entorno", "eq", "L02"),
+        ("_x00da_ltima", "eq", True),
+    ]
+    assert isinstance(received["filters"][1][2], bool)
     assert received["top"] == 100
 
 
@@ -705,3 +709,305 @@ def test_search_select_more_than_50_returns_422(wired_client):
     )
 
     assert resp.status_code == 422
+
+
+# ----------------------------------------------------------------------
+# POST /v1/sharepoint/list/items:search — operadores (`op`), capa de schema
+#
+# Frontera 422/400: aquí solo lo que puede juzgarse con el body. Que la columna
+# real admita el operador y el tipo se valida en el servicio (ver
+# tests/test_sharepoint_service.py).
+# ----------------------------------------------------------------------
+
+
+def _search_capturing(wired_client):
+    """Cablea el endpoint capturando los filtros que llegan al servicio."""
+    client, fake_sp, fake_resolver = wired_client
+    received = {}
+
+    fake_resolver.resolve_list = _resolve_list
+
+    async def fake_search(site_id, list_id, *, filters=None, order_by=None, select=None, top=100):
+        received.update(filters=filters)
+        return [], False
+
+    fake_sp.search_list_items = fake_search
+    return client, received
+
+
+def test_search_op_passed_through_to_service(wired_client):
+    client, received = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [
+                {"field": "Estado", "op": "in", "value": ["Iniciado", "Pausado"]},
+                {"field": "FechaFinalizado", "op": "ge", "value": "2026-08-18T00:00:00Z"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert received["filters"] == [
+        ("Estado", "in", ["Iniciado", "Pausado"]),
+        ("FechaFinalizado", "ge", "2026-08-18T00:00:00Z"),
+    ]
+
+
+@pytest.mark.parametrize("bad_op", ["contains", "ne", "startswith", "eq 1 or 1", "EQ", ""])
+def test_search_unknown_op_returns_422(wired_client, bad_op):
+    # enum cerrado: ningún token del caller puede llegar a la expresión OData
+    client, fake_sp, fake_resolver = wired_client
+    fake_resolver.resolve_list = _resolve_list
+    called = {"n": 0}
+
+    async def fake_search(site_id, list_id, *, filters=None, order_by=None, select=None, top=100):
+        called["n"] += 1
+        return [], False
+
+    fake_sp.search_list_items = fake_search
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [{"field": "Entorno", "op": bad_op, "value": "L02"}],
+        },
+    )
+
+    assert resp.status_code == 422
+    # el servicio no se llegó a invocar: el token se rechaza antes de que exista
+    # ninguna expresión OData en la que pudiera colarse
+    assert called["n"] == 0
+
+
+def test_search_in_with_scalar_value_returns_422(wired_client):
+    client, _ = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [{"field": "Estado", "op": "in", "value": "Iniciado"}],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("op", ["eq", "ge", "gt", "le", "lt"])
+def test_search_non_in_op_with_array_value_returns_422(wired_client, op):
+    client, _ = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [{"field": "hohl", "op": op, "value": [1, 2]}],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("size", [0, 21, 30])
+def test_search_in_array_out_of_bounds_returns_422(wired_client, size):
+    client, _ = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [
+                {"field": "Estado", "op": "in", "value": [f"S{i}" for i in range(size)]}
+            ],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_search_in_array_of_20_is_accepted(wired_client):
+    client, received = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [
+                {"field": "Estado", "op": "in", "value": [f"S{i}" for i in range(20)]}
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert len(received["filters"][0][2]) == 20
+
+
+@pytest.mark.parametrize(
+    "mixed",
+    [
+        ["Iniciado", 3],
+        [True, 1],  # bool NO se colapsa en int: array mixto, no válido
+        [1, "2"],
+        ["a", True],
+    ],
+)
+def test_search_mixed_type_in_array_returns_422(wired_client, mixed):
+    client, _ = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [{"field": "Estado", "op": "in", "value": mixed}],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_search_in_array_mixing_int_and_float_is_accepted(wired_client):
+    # JSON tiene un único tipo numérico y las columnas numéricas aceptan ambos
+    client, received = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [{"field": "hohl", "op": "in", "value": [1, 2.5]}],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert [type(v).__name__ for v in received["filters"][0][2]] == ["int", "float"]
+
+
+def test_search_clause_budget_exceeded_returns_422_with_count_and_limit(wired_client):
+    # 6 filtros × 20 valores = 120 cláusulas > 100
+    client, fake_sp, fake_resolver = wired_client
+    fake_resolver.resolve_list = _resolve_list
+    called = {"n": 0}
+
+    async def fake_search(site_id, list_id, *, filters=None, order_by=None, select=None, top=100):
+        called["n"] += 1
+        return [], False
+
+    fake_sp.search_list_items = fake_search
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [
+                {"field": f"F{i}", "op": "in", "value": [f"v{j}" for j in range(20)]}
+                for i in range(6)
+            ],
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = str(resp.json()["detail"])
+    assert "120" in detail and "100" in detail
+    assert called["n"] == 0
+
+
+def test_search_clause_budget_at_limit_is_accepted(wired_client):
+    # 5 filtros × 20 valores = exactamente 100 cláusulas
+    client, received = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [
+                {"field": f"F{i}", "op": "in", "value": [f"v{j}" for j in range(20)]}
+                for i in range(5)
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert sum(len(f[2]) for f in received["filters"]) == 100
+
+
+def test_search_body_without_op_still_valid(wired_client):
+    # regresión de compatibilidad: un body de la v2.5.0 sigue siendo válido y
+    # llega al servicio con `eq` resuelto
+    client, received = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [
+                {"field": "Entorno", "value": "L02"},
+                {"field": "_x00da_ltima", "value": True},
+                {"field": "Cliente_x002d_LIBSALookupId", "value": 35},
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert received["filters"] == [
+        ("Entorno", "eq", "L02"),
+        ("_x00da_ltima", "eq", True),
+        ("Cliente_x002d_LIBSALookupId", "eq", 35),
+    ]
+
+
+def test_search_more_than_15_filters_still_422_with_op(wired_client):
+    client, _ = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [
+                {"field": f"F{i}", "op": "eq", "value": "x"} for i in range(16)
+            ],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("bad_top", [0, -1, 5001])
+def test_search_top_out_of_range_still_422_with_op(wired_client, bad_top):
+    client, _ = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [{"field": "Estado", "op": "in", "value": ["a"]}],
+            "top": bad_top,
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("bad_value", [None, {"a": 1}, [None], [{"a": 1}], [[1]]])
+def test_search_unsupported_in_element_type_returns_422(wired_client, bad_value):
+    client, _ = _search_capturing(wired_client)
+
+    resp = client.post(
+        _SEARCH_URL,
+        json={
+            "sharepoint_url": _LIST_URL,
+            "filters": [{"field": "Estado", "op": "in", "value": bad_value}],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_search_op_field_is_a_closed_enum_in_openapi():
+    schema = app.openapi()["components"]["schemas"]["SearchFilter"]
+    assert schema["properties"]["op"]["enum"] == ["eq", "in", "ge", "gt", "le", "lt"]
+    assert schema["properties"]["op"]["default"] == "eq"
+    # `op` es opcional: un body sin él sigue siendo válido
+    assert "op" not in schema["required"]
