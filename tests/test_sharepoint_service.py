@@ -816,3 +816,52 @@ async def test_search_whole_expression_percent_encoded_as_one_unit(sp):
     )
     raw = url.split("$filter=")[1].split("&")[0]
     assert not any(c in raw for c in "() '")
+
+
+# ----------------------------------------------------------------------
+# Columna de sistema ID (v2.6.1): acceso directo y rechazo en búsqueda
+# ----------------------------------------------------------------------
+
+
+async def test_get_list_item_addresses_item_by_id(sp):
+    captured = {}
+
+    async def fake_get(url, extra_headers=None):
+        captured["url"] = url
+        return {"id": "1087", "webUrl": "https://host/item/1087"}
+
+    sp._get = fake_get
+    item = await sp.get_list_item("SITE", "LIST", 1087)
+
+    assert captured["url"] == (
+        "https://graph.microsoft.com/v1.0/sites/SITE/lists/LIST/items/1087"
+    )
+    assert item["id"] == "1087"
+
+
+@pytest.mark.parametrize("field", ["ID", "Id", "id"])
+@pytest.mark.parametrize(
+    "spec_tail",
+    [("eq", "1087"), ("in", ["1", "2"]), ("ge", 10), ("gt", 10), ("le", 10), ("lt", 10)],
+)
+async def test_search_on_id_column_rejected_without_calling_graph(sp, field, spec_tail):
+    called = {"graph": False}
+
+    async def fake_get(url, extra_headers=None):
+        called["graph"] = True
+        return {"value": []}
+
+    sp._get = fake_get
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.search_list_items("SITE", "LIST", filters=[(field, *spec_tail)])
+
+    assert exc.value.status_code == 400
+    assert field in exc.value.message
+    assert "PATCH /v1/sharepoint/list/item" in exc.value.message
+    assert called["graph"] is False
+
+
+async def test_search_on_id_column_rejected_in_legacy_two_tuple_form(sp):
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.search_list_items("SITE", "LIST", filters=[("ID", "1087")])
+    assert exc.value.status_code == 400

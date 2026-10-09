@@ -377,3 +377,15 @@ silencio— pero es una petición que el conector aceptó y no debería.
 **Seguimiento propuesto, no plegado en esta iteración:** presupuestar por
 longitud del `$filter` generado (~3 KB sin encodear, `400` en el servicio antes
 de la llamada) y dejar el conteo de cláusulas como guarda barata en el schema.
+
+---
+
+### 2026-10-09 — Agente LLM (Claude Code) · Enmienda v2.6.1: columna `ID` en filtros
+
+**Problema.** Un filtro sobre la columna de sistema `ID` pasaba la validación contra el esquema (es una columna real de la lista), pero Graph lo rechaza con `400 "A provided field name is not recognized"` con cualquier valor y operador. El caller recibía un error críptico.
+
+**Cambio.** `search_list_items()` rechaza cualquier filtro sobre `ID` (cualquier capitalización y cualquier operador) con un `400` que nombra la columna, explica que Graph no filtra por ella y remite a `PATCH /v1/sharepoint/list/item` con `filter_by.field = "ID"` (ver la enmienda v2.6.1 de SPEC-002). El rechazo ocurre antes de cualquier llamada a Graph, incluida la lectura de columnas. No se añade búsqueda por `ID`: el filtro de nivel superior `id` de Graph sobre ítems de lista no está verificado y ningún consumidor lo necesita. `order_by` no cambia.
+
+**Criterios de aceptación añadidos:**
+- [x] Un filtro `ID` con `eq`, `in`, `ge`, `gt`, `le` o `lt`, y `ID`/`Id`/`id`, devuelve `400` nombrando la columna, sin llamar a Graph.
+- [x] Los filtros sobre otras columnas siguen igual (suite completa en verde, 245/245).

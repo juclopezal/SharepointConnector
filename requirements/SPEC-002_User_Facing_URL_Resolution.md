@@ -68,3 +68,28 @@ Las claves de `data` siguen siendo los **nombres internos** de columna (sin reso
 - `VERSION`, `doc/CHANGELOG.md`, `README.md`, `ARQUITECTURA.md`
 
 **Sin desviaciones del diseño propuesto.**
+
+---
+
+## Enmienda v2.6.1 — 2026-10-09 — `PATCH /list/item` localizado por `ID`
+
+**Problema.** `PATCH /v1/sharepoint/list/item` (añadido en la v2.2.0) localiza el registro con `$filter=fields/{field} eq '{value}'`. Con `filter_by.field = "ID"`, Graph responde `400 "A provided field name is not recognized"` con cualquier valor. `ID` es el identificador del ítem, no una entrada filtrable de `fields`. Lo detectó el consumidor del flujo de cierre al actualizar `Estimadas` en `Oper/Lists/Trabajos` (request_id `89765346-d5b8-4042-8641-4e64f20bd90b`).
+
+**Cambio.** Si `filter_by.field` es `ID` (sin distinguir mayúsculas), el ítem se direcciona directamente: `GET .../items/{id}` y luego `PATCH .../items/{id}/fields`.
+
+**Criterios de aceptación añadidos:**
+- [x] `filter_by: {field: "ID", value: "<id existente>"}` actualiza ese ítem y responde `200` con el contrato de siempre.
+- [x] `ID`, `Id` e `id` se comportan igual.
+- [x] Un `ID` inexistente (incluido `"0"`) devuelve `404` con el mensaje de "ningún registro coincide" y no escribe nada.
+- [x] Un valor no numérico (o de más de 10 dígitos) devuelve `400` antes de resolver la URL o llamar a Graph.
+- [x] Nunca se envía a Graph un `$filter` sobre `ID`.
+- [x] Los demás campos de `filter_by` siguen igual (`404`/`409`).
+
+**Bitácora de IA (2026-10-09 — Agente LLM, Claude Code):**
+- `app/services/sharepoint.py`: añade `get_list_item()`, el acceso directo por ID.
+- `app/api/v1/endpoints/sharepoint.py`: añade una guarda por `ID` en `update_list_item_by_url`. El helper `_find_list_item_by_id()` devuelve `[item]` o `[]` ante un `404` de Graph, así el endpoint reutiliza su camino de no coincidencia sin un mensaje distinto.
+- **Decisiones:**
+  - La rama vive en el endpoint y no en `find_list_items_by_field`, para que ese nombre siga describiendo una búsqueda por `$filter`.
+  - Se hace un `GET` antes del `PATCH` para conservar `webUrl` en la respuesta y dar un `404` antes de escribir.
+  - Se valida con `[0-9]{1,10}` y no con `\d`, que acepta dígitos Unicode, porque el valor se interpola en la ruta.
+- **Desviaciones:** ninguna respecto a la propuesta OpenSpec `fix-filter-by-id`. Queda como seguimiento el upsert con `key_field: "ID"`, que falla igual.

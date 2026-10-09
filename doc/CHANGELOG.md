@@ -1,3 +1,29 @@
+## v2.6.1 — 2026-10-09
+
+### Fix: `PATCH /list/item` localizado por `ID` (SPEC-002, SPEC-004)
+
+**Contexto:** `PATCH /v1/sharepoint/list/item` localizaba siempre el registro con `$filter=fields/{field} eq '{value}'`. Con `filter_by.field = "ID"`, Graph responde `400 "A provided field name is not recognized"` con cualquier valor: `ID` es el identificador del propio ítem, no una entrada filtrable de `fields`. Bloqueaba el paso 5 del flujo de cierre, que actualiza `Estimadas` en la lista `Trabajos` por `ID`. `Trabajos` no tiene otra columna única: `Cod_x002e_Propuesta` tiene 279 valores repetidos y `Ticket` tiene vacíos y duplicados. `items:search` con un filtro sobre `ID` fallaba igual.
+
+**Solución:**
+- **Actualizar por `ID`:** si `filter_by.field` es `ID` (sin distinguir mayúsculas), el conector no busca. Hace `GET .../items/{id}`, que da un `404` limpio antes de escribir y aporta el `webUrl` de la respuesta, y después el mismo `PATCH .../items/{id}/fields`. Contrato de request y response sin cambios.
+- `filter_by.value` debe tener 1–10 dígitos ASCII, porque se interpola en la ruta de Graph. Si no, devuelve `400` antes de llamar a Graph.
+- Un `ID` inexistente, incluido `"0"`, devuelve `404` con el mismo mensaje que "ningún registro coincide". El `409` no aplica, porque el `ID` es único.
+- **Buscar con `ID`:** en `items:search`, un filtro sobre `ID` (cualquier operador y cualquier capitalización) se rechaza con un `400` que explica el motivo y remite a `PATCH /list/item`, en lugar de reenviar el error críptico de Graph. No se añade búsqueda por `ID`.
+
+**Retrocompatible:** las peticiones sobre `ID` fallaban en la v2.6.0 en ambos endpoints. El resto de campos se comportan igual.
+
+**Fuera de alcance:** el upsert con `key_field: "ID"` falla igual, pero no tiene una rama de creación con sentido, así que queda como seguimiento. `order_by` sobre `ID` no se toca, porque no se ha visto que falle.
+
+**Archivos modificados:**
+- `app/services/sharepoint.py` — `get_list_item()` y rechazo de `ID` en `search_list_items()`
+- `app/api/v1/endpoints/sharepoint.py` — rama por `ID` en `update_list_item_by_url`, `_ITEM_ID_RE` y `_find_list_item_by_id()`, más la documentación en `/docs`
+- `app/schemas/sharepoint.py` — descripciones de `FilterBy`
+- `tests/test_sharepoint_service.py`, `tests/test_sharepoint_endpoints.py` — 35 tests nuevos (245/245 en verde)
+- `VERSION`, `README.md`, `ARQUITECTURA.md`, `arquitecturasUML.md`, `requirements/SPEC-002`, `requirements/SPEC-004`
+- OpenSpec: cambio `fix-filter-by-id` y capability nueva `list-item-update-by-url`
+
+---
+
 ## v2.6.0 — 2026-09-03
 
 ### Feature: Operadores de filtro (`in`, `ge`, `gt`, `le`, `lt`) en items:search (SPEC-004)

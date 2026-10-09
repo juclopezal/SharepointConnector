@@ -1,6 +1,6 @@
 # Arquitectura: SharePoint Connector
 
-**Versión:** 2.6.0  
+**Versión:** 2.6.1  
 **Fecha:** 2026-09-03  
 **Autor:** Juan Camilo López Alzate — Latinia  
 
@@ -205,6 +205,8 @@ La búsqueda usa `GET .../items?$expand=fields&$filter=fields/{field} eq '{value
 | 1 coincidencia | `200` — ítem actualizado |
 | 0 coincidencias | `404` — ningún registro coincide |
 | > 1 coincidencia | `409` — el filtro no es único; no se modifica nada |
+
+**Localizar por `ID` (v2.6.1).** Graph no reconoce `fields/ID` en un `$filter` (`400 "A provided field name is not recognized"` con cualquier valor): `ID` es el identificador del propio ítem, no una entrada filtrable de `fields`. Por eso, cuando `filter_by.field` es `ID` (sin distinguir mayúsculas), el endpoint no busca: valida que `filter_by.value` sean 1–10 dígitos ASCII (si no, `400` antes de llamar a Graph, porque el valor se interpola en la ruta), hace `GET .../items/{id}` (que aporta el `webUrl` de la respuesta y un `404` limpio antes de escribir nada) y luego el mismo `PATCH .../items/{id}/fields`. Un `404` de Graph se traduce al mismo mensaje de "ningún registro coincide"; el `409` no aplica, porque el `ID` es único. En `items:search`, un filtro sobre `ID` se rechaza con `400` explicativo en vez de reenviar el error de Graph.
 
 **Response 200:**
 ```json

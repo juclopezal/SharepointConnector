@@ -562,6 +562,25 @@ class SharePointService:
         )
         return result
 
+    async def get_list_item(self, site_id: str, list_id: str, item_id: int) -> dict:
+        """Obtiene un ítem por su ``ID`` de SharePoint (``GET .../items/{id}``).
+
+        Es el acceso directo que se usa cuando el caller localiza el registro por
+        ``ID``: Graph no admite ``$filter=fields/ID``, pero el ``ID`` de la lista
+        es el mismo identificador que usa ``/items/{item-id}``. ``item_id`` llega
+        ya validado como entero, así que no puede alterar la ruta. Si no existe,
+        Graph responde ``404`` (propagado como :class:`GraphAPIError`).
+        """
+        url = f"{GRAPH}/sites/{site_id}/lists/{list_id}/items/{int(item_id)}"
+        item = await self._get(url)
+        logger.info(
+            "Fetched list item id=%s in list %s",
+            item_id,
+            list_id,
+            extra={**_ctx(), "site_id": site_id, "list_id": list_id, "item_id": str(item_id)},
+        )
+        return item
+
     async def find_list_items_by_field(
         self, site_id: str, list_id: str, field: str, value: str
     ) -> list[dict]:
@@ -731,6 +750,20 @@ class SharePointService:
         como ``@odata.etag``); cada nombre se valida contra el esquema real
         (:func:`_validate_select_column`). Vacío u omitido → todos los campos.
         """
+        # Graph no admite filtrar por la columna de sistema ``ID`` (responde 400
+        # "A provided field name is not recognized" con cualquier valor): se
+        # rechaza antes de llamar a Graph con un error que explica la alternativa.
+        for spec in filters or []:
+            field = _normalize_search_filter(spec)[0]
+            if field.lower() == "id":
+                raise GraphAPIError(
+                    400,
+                    f"No se puede filtrar por la columna {field!r}: Microsoft Graph no "
+                    "admite filtrar ítems de lista por su ID. Para actualizar un "
+                    "ítem concreto por su ID usa PATCH /v1/sharepoint/list/item con "
+                    "filter_by.field = 'ID'.",
+                )
+
         columns: list[dict] | None = None
         if filters or select:
             columns = await self.get_list_columns(site_id, list_id)

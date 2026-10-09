@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.dependencies import get_resolver, get_sp
+from app.core.exceptions import GraphAPIError
 from app.main import app
 from app.services.resolver import ResolvedList, ResolvedUploadTarget
 
@@ -1011,3 +1012,129 @@ def test_search_op_field_is_a_closed_enum_in_openapi():
     assert schema["properties"]["op"]["default"] == "eq"
     # `op` es opcional: un body sin él sigue siendo válido
     assert "op" not in schema["required"]
+
+
+# ----------------------------------------------------------------------
+# PATCH /list/item localizado por ID (v2.6.1)
+# ----------------------------------------------------------------------
+
+
+def _wire_update_by_id(fake_sp, fake_resolver, existing_ids=("1087",)):
+    """Cablea get_list_item/update_list_item y prohíbe la búsqueda por $filter."""
+    calls = {"get": [], "update": [], "find": 0}
+    fake_resolver.resolve_list = _resolve_list
+
+    async def fake_get(site_id, list_id, item_id):
+        calls["get"].append((site_id, list_id, item_id))
+        if str(item_id) not in existing_ids:
+            raise GraphAPIError(404, "Item not found")
+        return {"id": str(item_id), "webUrl": f"https://host/item/{item_id}"}
+
+    async def fake_update(site_id, list_id, item_id, fields):
+        calls["update"].append((site_id, list_id, item_id, fields))
+        return {}
+
+    async def fake_find(*args, **kwargs):
+        calls["find"] += 1
+        return []
+
+    fake_sp.get_list_item = fake_get
+    fake_sp.update_list_item = fake_update
+    fake_sp.find_list_items_by_field = fake_find
+    return calls
+
+
+def _patch_by(client, field, value, data=None):
+    return client.patch(
+        "/v1/sharepoint/list/item",
+        json={
+            "sharepoint_url": "https://host/Oper/Lists/Trabajos/Listado.aspx",
+            "filter_by": {"field": field, "value": value},
+            "data": data if data is not None else {"Estimadas": 12},
+        },
+    )
+
+
+@pytest.mark.parametrize("field", ["ID", "Id", "id"])
+def test_update_by_id_addresses_item_directly(wired_client, field):
+    client, fake_sp, fake_resolver = wired_client
+    calls = _wire_update_by_id(fake_sp, fake_resolver)
+
+    resp = _patch_by(client, field, "1087")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "updated",
+        "id": "1087",
+        "webUrl": "https://host/item/1087",
+        "site_id": "SITE",
+        "list_id": "LIST",
+    }
+    assert calls["get"] == [("SITE", "LIST", 1087)]
+    assert calls["update"] == [("SITE", "LIST", "1087", {"Estimadas": 12})]
+    # nunca se construye un $filter sobre ID
+    assert calls["find"] == 0
+
+
+@pytest.mark.parametrize("value", ["0", "999999"])
+def test_update_by_nonexistent_id_returns_404_without_writing(wired_client, value):
+    client, fake_sp, fake_resolver = wired_client
+    calls = _wire_update_by_id(fake_sp, fake_resolver)
+
+    resp = _patch_by(client, "ID", value)
+
+    assert resp.status_code == 404
+    # mismo formato de mensaje que el "ningún registro coincide" por campo
+    assert resp.json()["error"] == (
+        f"No se encontró ningún registro con ID='{value}' en la lista"
+    )
+    assert calls["update"] == []
+    assert calls["find"] == 0
+
+
+@pytest.mark.parametrize(
+    "value", ["abc", "-1", "1 or 1", "", "1/../2", "12a", "١٢", "12345678901"]
+)
+def test_update_by_non_numeric_id_returns_400_without_calling_graph(wired_client, value):
+    client, fake_sp, fake_resolver = wired_client
+    resolved = {"called": False}
+
+    async def tracking_resolve(url):
+        resolved["called"] = True
+        return await _resolve_list(url)
+
+    calls = _wire_update_by_id(fake_sp, fake_resolver)
+    fake_resolver.resolve_list = tracking_resolve
+
+    resp = _patch_by(client, "ID", value)
+
+    assert resp.status_code == 400
+    assert "ID" in resp.json()["error"]
+    assert resolved["called"] is False
+    assert calls == {"get": [], "update": [], "find": 0}
+
+
+def test_update_by_id_propagates_non_404_graph_errors(wired_client):
+    client, fake_sp, fake_resolver = wired_client
+    calls = _wire_update_by_id(fake_sp, fake_resolver)
+
+    async def failing_get(site_id, list_id, item_id):
+        raise GraphAPIError(403, "Forbidden")
+
+    fake_sp.get_list_item = failing_get
+
+    resp = _patch_by(client, "ID", "1087")
+
+    assert resp.status_code == 403
+    assert calls["update"] == []
+
+
+def test_update_by_other_field_still_uses_filter_search(wired_client):
+    client, fake_sp, fake_resolver = wired_client
+    calls = _wire_update_by_id(fake_sp, fake_resolver)
+
+    resp = _patch_by(client, "Ticket", "NO-EXISTE-0")
+
+    assert resp.status_code == 404
+    assert calls["find"] == 1
+    assert calls["get"] == []

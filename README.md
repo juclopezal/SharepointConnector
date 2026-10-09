@@ -2,7 +2,7 @@
 
 Microservicio REST que reemplaza Power Automate para operaciones sobre SharePoint vía Microsoft Graph API. Expone una API genérica y versionada que opera sobre cualquier site, lista y biblioteca de documentos de forma dinámica.
 
-**Versión actual:** 2.6.0
+**Versión actual:** 2.6.1
 
 ---
 
@@ -52,7 +52,7 @@ Ver [ARQUITECTURA.md](ARQUITECTURA.md) para la referencia completa.
 ### Health
 
 ```
-GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.6.0" }
+GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.6.1" }
 ```
 
 ---
@@ -99,6 +99,8 @@ curl -X PATCH "http://localhost:8003/v1/sharepoint/list/item" \
 ```
 
 `filter_by` debe identificar un **único** registro: si ninguno coincide se devuelve `404`, y si coincide más de uno, `409` (sin modificar nada).
+
+**Por `ID` (v2.6.1):** con `"filter_by": { "field": "ID", "value": "1087" }` el conector no busca, sino que actualiza directamente el ítem con ese identificador (Graph no admite filtrar por `ID`). El valor debe ser numérico (si no, `400`); un `ID` inexistente devuelve `404`.
 
 ### Insertar o actualizar un ítem (upsert)
 

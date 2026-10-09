@@ -7,6 +7,7 @@ el navegador.
 """
 
 import logging
+import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
@@ -34,6 +35,26 @@ from app.services.sharepoint import SharePointService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sharepoint", tags=["SharePoint (by URL)"])
+
+# ID de ítem de SharePoint: solo dígitos ASCII (``\d`` aceptaría otros dígitos
+# Unicode). Se interpola en la ruta de Graph, así que nada más puede pasar.
+_ITEM_ID_RE = re.compile(r"[0-9]{1,10}\Z")
+
+
+async def _find_list_item_by_id(
+    sp: SharePointService, site_id: str, list_id: str, item_id: int
+) -> list[dict]:
+    """Localiza un ítem por su ``ID`` con la misma forma que la búsqueda por campo.
+
+    Devuelve ``[item]`` o ``[]`` si Graph responde 404, de modo que el endpoint
+    reutiliza su camino de "ningún registro coincide" sin un mensaje distinto.
+    """
+    try:
+        return [await sp.get_list_item(site_id, list_id, item_id)]
+    except GraphAPIError as exc:
+        if exc.status_code == 404:
+            return []
+        raise
 
 
 @router.post(
@@ -83,7 +104,13 @@ async def update_list_item_by_url(
     su `id` interno y luego aplica `data`. Tanto `filter_by.field` como las claves de
     `data` deben ser **nombres internos** de columna.
 
+    **Localizar por `ID`:** si `filter_by.field` es `ID` (sin distinguir mayúsculas),
+    el conector no busca: accede directamente al ítem con ese identificador
+    (`filter_by.value` debe ser numérico). Graph no admite filtrar por `ID`, pero sí
+    direccionar el ítem por él.
+
     Respuestas de error:
+    - `400` si `filter_by.field` es `ID` y `filter_by.value` no es numérico.
     - `404` si ningún registro coincide con `filter_by`.
     - `409` si coincide más de uno (el filtro no era único).
     """
@@ -93,13 +120,26 @@ async def update_list_item_by_url(
         payload.filter_by.field,
         payload.filter_by.value,
     )
+    by_id = payload.filter_by.field.lower() == "id"
+    if by_id and not _ITEM_ID_RE.match(payload.filter_by.value):
+        raise GraphAPIError(
+            400,
+            f"filter_by.value={payload.filter_by.value!r} no es un ID válido: con "
+            f"filter_by.field='{payload.filter_by.field}' el valor debe ser numérico.",
+        )
+
     resolved = await resolver.resolve_list(payload.sharepoint_url)
-    matches = await sp.find_list_items_by_field(
-        resolved.site_id,
-        resolved.list_id,
-        payload.filter_by.field,
-        payload.filter_by.value,
-    )
+    if by_id:
+        matches = await _find_list_item_by_id(
+            sp, resolved.site_id, resolved.list_id, int(payload.filter_by.value)
+        )
+    else:
+        matches = await sp.find_list_items_by_field(
+            resolved.site_id,
+            resolved.list_id,
+            payload.filter_by.field,
+            payload.filter_by.value,
+        )
 
     if not matches:
         raise GraphAPIError(

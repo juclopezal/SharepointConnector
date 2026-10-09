@@ -66,12 +66,17 @@ class FilterBy(BaseModel):
         pattern=r"^[A-Za-z0-9_]+$",
         description=(
             "Nombre interno (internal name) de la columna que identifica de forma "
-            "única el registro, p. ej. '_x006c_dq4'. Solo letras, dígitos y '_'."
+            "única el registro, p. ej. '_x006c_dq4'. Solo letras, dígitos y '_'. "
+            "Con 'ID' (sin distinguir mayúsculas) el ítem se direcciona "
+            "directamente por su identificador en vez de buscarse."
         ),
     )
     value: str = Field(
         ...,
-        description="Valor exacto que debe tener `field` en el registro a actualizar.",
+        description=(
+            "Valor exacto que debe tener `field` en el registro a actualizar. "
+            "Si `field` es 'ID', debe ser numérico (p. ej. '1087')."
+        ),
     )
 
 
