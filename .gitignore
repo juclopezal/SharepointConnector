@@ -6,3 +6,7 @@ __pycache__/
 # Logs
 *.log
 logs/
+
+# Almacén de claves de API (SPEC-005) — nunca se versiona
+data/
+*.db

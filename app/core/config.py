@@ -35,5 +35,14 @@ class Settings(BaseSettings):
     log_dir: str = ""
     log_file: str = "api_server_sp_connector.log"
 
+    # ── Autenticación por clave de API (SPEC-005) ────────────────────────────
+    # Secreto de servidor para el HMAC-SHA256 de las claves. Si está vacío, la
+    # autenticación por clave queda DESHABILITADA (modo compatibilidad: el
+    # servicio no exige X-API-Key). Debe fijarse en producción.
+    api_key_hmac_secret: str = ""
+    # Ruta del archivo SQLite con las claves habilitadas. Debe residir en un
+    # volumen persistente (no dentro de la imagen). La tabla se crea al arrancar.
+    api_key_db_path: str = "data/api_keys.db"
+
 
 settings = Settings()

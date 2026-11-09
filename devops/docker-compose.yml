@@ -12,9 +12,17 @@ services:
       - .env
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Almacén persistente de claves de API (SPEC-005). El archivo SQLite vive
+      # en el volumen, no dentro de la imagen. Debe coincidir con el directorio
+      # de API_KEY_DB_PATH (por defecto /app/data/api_keys.db).
+      - sp-connector-data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
       interval: 30s
       timeout: 10s
       start_period: 15s
       retries: 3
+
+volumes:
+  sp-connector-data:

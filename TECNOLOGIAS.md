@@ -63,7 +63,9 @@
 | Cliente HTTP | httpx | ≥ 0.28 |
 | Servidor ASGI | Uvicorn | ≥ 0.30 |
 | API de integración | Microsoft Graph API | v1.0 |
-| Autenticación | OAuth 2.0 Client Credentials | RFC 6749 |
+| Autenticación contra Graph | OAuth 2.0 Client Credentials | RFC 6749 |
+| Autenticación de callers | Clave de API (`X-API-Key`) + HMAC-SHA256 | SPEC-005 |
+| Almacén de claves | SQLite (`sqlite3`, stdlib) | — |
 | Contenerización | Docker + Docker Compose | — |
 
 ---

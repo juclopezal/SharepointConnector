@@ -294,6 +294,8 @@ Copia `devops/.env.example` a `devops/.env` y rellena los valores:
 | `TENANT_ID` | Sí | ID del tenant Azure AD |
 | `CLIENT_ID` | Sí | ID del App Registration |
 | `CLIENT_SECRET` | Sí | Secreto del App Registration |
+| `API_KEY_HMAC_SECRET` | No | Secreto para el HMAC-SHA256 de las claves de API. **Vacío = autenticación deshabilitada** (no se exige `X-API-Key`); fíjalo para forzar la validación (SPEC-005) |
+| `API_KEY_DB_PATH` | No | Ruta del SQLite con las claves habilitadas (default: `data/api_keys.db`; debe estar en volumen persistente) |
 | `LOG_LEVEL` | No | `DEBUG` / `INFO` / `WARNING` / `ERROR` (default: `INFO`) |
 | `TENANT_TIMEZONE` | No | Zona horaria IANA del tenant para acotar periodos del upsert (default: `UTC`) |
 | `LOG_DIR` | No | Directorio del log rotativo a fichero; vacío = solo consola (default: vacío) |
@@ -358,8 +360,30 @@ Los nombres de campo deben ser los **nombres internos** de las columnas en Share
 
 | Cabecera | Dirección | Descripción |
 |---|---|---|
-| `X-App-ID` | Request | Identificador del caller — se registra en todos los logs |
+| `X-API-Key` | Request | **Clave de autenticación del caller** (SPEC-005). Obligatoria en todos los `/v1/...` cuando la auth está habilitada; ausente/invalida/revocada → `401`. `/health` no la exige |
+| `X-App-ID` | Request | Identificador informativo del caller — se registra en todos los logs (no verificado) |
 | `X-Request-ID` | Response | UUID de trazabilidad generado por el middleware |
+
+### Autenticación y auditoría (SPEC-005)
+
+Cada petición a `/v1/...` debe incluir `X-API-Key`. El conector valida la clave
+contra un almacén SQLite de claves habilitadas (guardadas como **HMAC-SHA256**,
+nunca en claro) y registra en cada log de petición el `principal` (identidad del
+titular), la ruta y el `status_code` — el rastro de auditoría. `/health` es público.
+
+Emitir una clave (imprime la clave en claro una sola vez; entrégala por canal seguro):
+
+```bash
+python -m app.admin.api_keys_admin issue jdiaz
+```
+
+Revocar, reactivar, borrar o consultar son sentencias SQL directas sobre el
+archivo (`python -m app.admin.api_keys_admin --help-sql` las lista). Rotar una
+clave = revocar la vieja + emitir una nueva.
+
+> Si `API_KEY_HMAC_SECRET` está vacío, la autenticación queda **deshabilitada**
+> (modo compatibilidad para el despliegue escalonado) y el servicio emite un
+> aviso al arrancar. Fíjalo para forzar la validación.
 
 ---
 

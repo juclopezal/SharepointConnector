@@ -1,3 +1,40 @@
+## v2.7.0 — 2026-11-09
+
+### Feature: Autenticación por clave de API y auditoría por identidad (SPEC-005)
+
+**Contexto:** el conector opera con permisos de aplicación amplios sobre todo el tenant (`Sites.ReadWrite.All`) pero no validaba quién le llamaba: la cabecera `X-App-ID` es informativa y ni siquiera obligatoria. No había forma fiable de saber —ni de auditar— qué llamante ejecutó cada operación.
+
+**Solución:**
+- **`X-API-Key` obligatoria en `/v1/...`:** cada petición debe traer la clave en la cabecera. Ausente, vacía, desconocida o revocada → `401` sin llegar a Graph. `/health` queda público. La dependencia se aplica a nivel del router `/v1` (`APIKeyHeader`, visible en OpenAPI).
+- **Almacén SQLite de claves habilitadas:** tabla `api_keys(principal, key_hash, active, created_at, last_used)`. Las claves se guardan como **HMAC-SHA256** (secreto de servidor), nunca en claro; validación en tiempo constante (`hmac.compare_digest`) y solo filas `active=1`.
+- **Auditoría por identidad:** nuevo campo `principal` en la whitelist `_EXTRA_FIELDS` y propagado por `ContextVar`. El log "HTTP request completed" registra ahora `principal` + `path` + `status_code`, incluidos los intentos rechazados (`401`). La clave nunca se registra.
+- **Gestión de claves:** alta con `python -m app.admin.api_keys_admin issue <principal>` (genera clave aleatoria + HMAC, imprime la clave una sola vez). Revocar/reactivar/borrar/consultar = SQL directo (`--help-sql`). Rotar = revocar + nueva alta.
+- **Modo compatibilidad:** si `API_KEY_HMAC_SECRET` está vacío, la auth queda deshabilitada (aviso al arrancar) para permitir un despliegue escalonado: desplegar, repartir claves, y luego fijar el secreto para forzar la validación.
+
+**Retrocompatible por defecto:** sin `API_KEY_HMAC_SECRET` el comportamiento no cambia. Al fijarlo, los clientes **deben** enviar `X-API-Key` (cambio de contrato, ya anticipado a los usuarios).
+
+**Fuera de alcance:** autorización por usuario/lista (RBAC, `403`) e identidad verificada vía Entra ID (OAuth2 `Bearer`) quedan como fases futuras en la SPEC-005.
+
+**Archivos nuevos:**
+- `app/core/api_keys.py` — almacén SQLite + HMAC
+- `app/core/security.py` — dependencia `require_principal`
+- `app/admin/api_keys_admin.py`, `app/admin/__init__.py` — utilidad de alta y ayuda SQL
+- `tests/test_api_key_auth.py` — 12 tests (257/257 en verde)
+
+**Archivos modificados:**
+- `app/core/config.py` — `api_key_hmac_secret`, `api_key_db_path`
+- `app/core/context.py` — `principal_var`
+- `app/core/dependencies.py` — `get_api_key_store()` singleton
+- `app/core/exceptions.py` — `APIKeyError` + handler
+- `app/core/logging.py` — `principal` en `_EXTRA_FIELDS`
+- `app/api/v1/router.py` — dependencia de auth en `/v1`
+- `app/main.py` — handler, `principal` en el log de auditoría, aviso de auth deshabilitada
+- `devops/.env.example`, `devops/docker-compose.yml` (volumen `sp-connector-data`), `.gitignore`
+- `README.md`, `ARQUITECTURA.md`, `TECNOLOGIAS.md`, `VERSION`, `requirements/SPEC-005`
+- OpenSpec: cambio `add-api-key-auth-audit` (capabilities `api-key-auth`, `request-audit-log`)
+
+---
+
 ## v2.6.1 — 2026-10-09
 
 ### Fix: `PATCH /list/item` localizado por `ID` (SPEC-002, SPEC-004)

@@ -8,7 +8,9 @@ from app.api.v1.router import router as v1_router
 from app.core.config import settings
 from app.core.context import client_app_id_var, request_id_var
 from app.core.exceptions import (
+    APIKeyError,
     GraphAPIError,
+    api_key_exception_handler,
     graph_api_exception_handler,
     unhandled_exception_handler,
 )
@@ -16,6 +18,12 @@ from app.core.logging import configure_logging
 
 configure_logging(settings.log_level, settings.log_dir, settings.log_file)
 logger = logging.getLogger(__name__)
+
+if not settings.api_key_hmac_secret:
+    logger.warning(
+        "API key authentication is DISABLED (API_KEY_HMAC_SECRET not set) — "
+        "all /v1 requests are allowed through. Set the secret to enforce X-API-Key."
+    )
 
 app = FastAPI(
     title=settings.app_name,
@@ -28,6 +36,7 @@ app = FastAPI(
 )
 
 # Exception handlers
+app.add_exception_handler(APIKeyError, api_key_exception_handler)
 app.add_exception_handler(GraphAPIError, graph_api_exception_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 
@@ -71,11 +80,15 @@ async def request_logging_middleware(request: Request, call_next):
         raise
 
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    # principal lo fija la dependencia de auth en request.state; "-" si la
+    # petición no se autenticó (rechazada con 401 o auth deshabilitada).
+    principal = getattr(request.state, "principal", "-")
     logger.info(
         "HTTP request completed",
         extra={
             "request_id": request_id,
             "client_app_id": client_app_id,
+            "principal": principal,
             "method": request.method,
             "path": request.url.path,
             "status_code": response.status_code,

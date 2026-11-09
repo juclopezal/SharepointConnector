@@ -123,10 +123,13 @@ graph TD
 | **Config** | `app/core/config.py` | Variables de entorno validadas con pydantic-settings |
 | **TokenManager** | `app/core/auth.py` | Obtención y caché del token OAuth2 (client_credentials) |
 | **Dependencies** | `app/core/dependencies.py` | Singletons inyectables via `lru_cache` (FastAPI DI) |
-| **Exceptions** | `app/core/exceptions.py` | `GraphAPIError` y handlers de error para FastAPI |
+| **Exceptions** | `app/core/exceptions.py` | `GraphAPIError`, `APIKeyError` y handlers de error para FastAPI |
 | **Logging** | `app/core/logging.py` | `JSONFormatter` para logs estructurados en JSON |
-| **Context** | `app/core/context.py` | `ContextVar`s para `request_id` y `client_app_id` |
-| **Router v1** | `app/api/v1/router.py` | Agrupador de endpoints bajo prefijo `/v1` |
+| **Context** | `app/core/context.py` | `ContextVar`s para `request_id`, `client_app_id` y `principal` |
+| **API Keys** | `app/core/api_keys.py` | Almacén SQLite de claves habilitadas (HMAC-SHA256) y validación (SPEC-005) |
+| **Security** | `app/core/security.py` | Dependencia `require_principal` que valida `X-API-Key` y resuelve el `principal` |
+| **Admin de claves** | `app/admin/api_keys_admin.py` | Utilidad CLI: alta de claves (`issue`) y ayuda SQL para revocar/consultar |
+| **Router v1** | `app/api/v1/router.py` | Agrupador de endpoints bajo prefijo `/v1`; aplica la autenticación por clave |
 | **Discovery** | `app/api/v1/endpoints/discovery.py` | Endpoints de exploración (sites, listas, drives, carpetas) |
 | **List Items** | `app/api/v1/endpoints/list_items.py` | Lectura y creación de ítems en listas |
 | **Files** | `app/api/v1/endpoints/files.py` | Subida, metadata y descarga de archivos |
@@ -594,7 +597,8 @@ Descarga el contenido binario del archivo.
 
 | Cabecera | Dirección | Descripción |
 |---|---|---|
-| `X-App-ID` | Request | Identificador del caller. Se registra en todos los logs |
+| `X-API-Key` | Request | Clave de autenticación del caller (SPEC-005); obligatoria en `/v1/...` con la auth habilitada |
+| `X-App-ID` | Request | Identificador informativo del caller (no verificado). Se registra en todos los logs |
 | `X-Request-ID` | Response | UUID generado por el middleware para trazabilidad |
 
 ### Códigos de error
@@ -602,7 +606,7 @@ Descarga el contenido binario del archivo.
 | Código | Causa |
 |---|---|
 | `400` | Parámetro inválido o faltante |
-| `401` | Fallo de autenticación con Microsoft Graph |
+| `401` | `X-API-Key` ausente, inválida o revocada (SPEC-005); o fallo de autenticación con Microsoft Graph |
 | `403` | Permisos insuficientes (site sin grant, permisos Graph incorrectos) |
 | `404` | Recurso no encontrado en SharePoint (incluye `filter_by` sin coincidencias en `PATCH /v1/sharepoint/list/item`) |
 | `409` | Conflicto: `filter_by` coincide con más de un registro en `PATCH /v1/sharepoint/list/item` |
@@ -621,8 +625,13 @@ sequenceDiagram
     participant AAD as Azure AD
     participant Graph as Microsoft Graph
 
-    Caller->>Connector: HTTP request + X-App-ID
+    Caller->>Connector: HTTP request + X-API-Key
     Connector->>Connector: Asigna request_id (UUID)
+    Connector->>Connector: Valida X-API-Key contra el almacén SQLite (HMAC)
+    alt clave ausente / inválida / revocada
+        Connector-->>Caller: 401 (sin llamar a Graph) + auditoría
+    end
+    Connector->>Connector: resuelve principal (para la auditoría)
     Connector->>Connector: ¿token en caché válido?
     alt token expirado o no existe
         Connector->>AAD: POST /oauth2/v2.0/token<br/>grant_type=client_credentials

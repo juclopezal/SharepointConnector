@@ -18,6 +18,19 @@ class GraphAPIError(Exception):
         super().__init__(message)
 
 
+class APIKeyError(Exception):
+    """Fallo de autenticación por clave de API (SPEC-005). Siempre 401.
+
+    Se maneja con ``api_key_exception_handler`` para devolver el mismo envoltorio
+    de error que el resto del servicio (``error``/``request_id``/``path``).
+    """
+
+    def __init__(self, message: str = "Missing or invalid API key"):
+        self.status_code = 401
+        self.message = message
+        super().__init__(message)
+
+
 def raise_from_httpx(exc: httpx.HTTPStatusError) -> NoReturn:
     """Convert an httpx HTTP error from Graph API into a typed GraphAPIError."""
     status = exc.response.status_code
@@ -65,6 +78,19 @@ async def graph_api_exception_handler(request: Request, exc: GraphAPIError) -> J
             "path": request.url.path,
         },
         headers={"X-Request-ID": request_id},
+    )
+
+
+async def api_key_exception_handler(request: Request, exc: APIKeyError) -> JSONResponse:
+    request_id = request_id_var.get()
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.message,
+            "request_id": request_id,
+            "path": request.url.path,
+        },
+        headers={"X-Request-ID": request_id, "WWW-Authenticate": "ApiKey"},
     )
 
 

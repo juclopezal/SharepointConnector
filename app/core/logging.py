@@ -8,6 +8,7 @@ from typing import Any
 _EXTRA_FIELDS = frozenset({
     "request_id",
     "client_app_id",
+    "principal",
     "method",
     "path",
     "status_code",
