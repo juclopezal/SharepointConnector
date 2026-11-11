@@ -1,6 +1,6 @@
 # Diagramas de Arquitectura (PlantUML): SharePoint Connector
 
-**Versión:** 2.6.1
+**Versión:** 2.8.0
 **Fecha:** 2026-09-03
 **Autor:** Juan Camilo López Alzate — Latinia
 
@@ -82,10 +82,15 @@ package "app/core" {
   component "auth.py\nTokenManager" as AUTH
   component "config.py\nSettings" as CFG
   component "context.py\nContextVars" as CTX
-  component "dependencies.py\nget_sp()" as DEP
-  component "exceptions.py\nGraphAPIError" as EXC
+  component "dependencies.py\nget_sp() / get_authorizer()" as DEP
+  component "exceptions.py\nGraphAPIError / APIKeyError\nPermissionDeniedError" as EXC
   component "logging.py\nJSONFormatter" as LOG
+  component "security.py\nrequire_principal\nrequire_admin / require_*_permission" as SEC
+  component "api_keys.py\nApiKeyStore" as KEYS
+  component "permissions.py\nPermissionStore / Authorizer" as PERM
 }
+
+database "SQLite (volumen)\napi_keys\napi_key_permissions" as DB
 
 package "app/schemas" {
   component "discovery.py" as SCH_D
@@ -108,6 +113,15 @@ EP_FILE --> SCH_F
 EP_LIST --> SCH_L
 EP_SP --> SCH_SP
 EP_SP --> RES
+EP_DISC --> SEC
+EP_LIST --> SEC
+EP_FILE --> SEC
+EP_SP --> SEC
+SEC --> KEYS
+SEC --> PERM
+KEYS --> DB
+PERM --> DB
+PERM --> EXC
 RES --> SRV
 DEP --> SRV
 DEP --> AUTH
@@ -245,8 +259,19 @@ participant Connector
 participant "Azure AD" as AAD
 participant "Microsoft Graph" as Graph
 
-Caller -> Connector : HTTP request + X-App-ID
+Caller -> Connector : HTTP request + X-API-Key (+ X-App-ID)
 Connector -> Connector : Asigna request_id (UUID)
+Connector -> Connector : Valida X-API-Key (HMAC en SQLite) → principal
+alt clave ausente / inválida / revocada
+    Connector --> Caller : 401 (sin llamar a Graph) + auditoría
+end
+opt endpoint /v1/sharepoint (por URL)
+    Connector -> Graph : resuelve URL → site_id / list_id / drive_id
+end
+Connector -> Connector : ¿permiso del principal sobre la lista? (SPEC-006)
+alt sin permiso (o discovery sin is_admin)
+    Connector --> Caller : 403 permissionDenied (sin operar en Graph) + auditoría
+end
 Connector -> Connector : ¿token en caché válido?
 alt token expirado o no existe
     Connector -> AAD : POST /oauth2/v2.0/token\ngrant_type=client_credentials
@@ -256,5 +281,42 @@ end
 Connector -> Graph : Llamada con Bearer token
 Graph --> Connector : 200 / error
 Connector --> Caller : respuesta + X-Request-ID
+@enduml
+```
+
+---
+
+## 6. Modelo de datos de claves y permisos (SPEC-005 / SPEC-006)
+
+```plantuml
+@startuml modelo-claves-permisos
+hide circle
+skinparam linetype ortho
+
+entity "api_keys" as K {
+  * principal : TEXT <<PK>>
+  --
+  * key_hash : TEXT <<UNIQUE>> (HMAC-SHA256)
+  * active : INTEGER (1 = habilitada)
+  * created_at : TEXT
+  last_used : TEXT
+  * is_admin : INTEGER (discovery)
+}
+
+entity "api_key_permissions" as P {
+  * principal : TEXT <<PK, FK>>
+  * site_id : TEXT <<PK>>
+  * list_id : TEXT <<PK>>
+  --
+  drive_id : TEXT (solo bibliotecas)
+  * list_url : TEXT (lectura humana)
+  * can_read : INTEGER
+  * can_create : INTEGER
+  * can_update : INTEGER
+  * can_delete : INTEGER
+  * granted_at : TEXT
+}
+
+K ||--o{ P : "ON DELETE CASCADE"
 @enduml
 ```

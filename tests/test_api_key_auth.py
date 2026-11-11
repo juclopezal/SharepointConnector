@@ -48,6 +48,10 @@ def auth_db(tmp_path):
 def auth_client(auth_db):
     """TestClient con autenticación ACTIVA (store real sobre el SQLite temporal)."""
     store = ApiKeyStore(auth_db, _SECRET)
+    # SPEC-006: /v1/graph/sites es discovery → exige is_admin. Estos tests de
+    # autenticación lo usan como endpoint de prueba, así que jdiaz es admin.
+    with sqlite3.connect(auth_db) as conn:
+        conn.execute("UPDATE api_keys SET is_admin = 1 WHERE principal = 'jdiaz'")
     app.dependency_overrides[get_api_key_store] = lambda: store
 
     async def fake_list_sites(search):

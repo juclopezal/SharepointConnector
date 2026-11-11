@@ -2,7 +2,7 @@
 
 Microservicio REST que reemplaza Power Automate para operaciones sobre SharePoint vía Microsoft Graph API. Expone una API genérica y versionada que opera sobre cualquier site, lista y biblioteca de documentos de forma dinámica.
 
-**Versión actual:** 2.6.1
+**Versión actual:** 2.8.0
 
 ---
 
@@ -52,7 +52,7 @@ Ver [ARQUITECTURA.md](ARQUITECTURA.md) para la referencia completa.
 ### Health
 
 ```
-GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.6.1" }
+GET /health  →  { "status": "ok", "service": "SharePoint Connector", "version": "2.8.0" }
 ```
 
 ---
@@ -294,7 +294,7 @@ Copia `devops/.env.example` a `devops/.env` y rellena los valores:
 | `TENANT_ID` | Sí | ID del tenant Azure AD |
 | `CLIENT_ID` | Sí | ID del App Registration |
 | `CLIENT_SECRET` | Sí | Secreto del App Registration |
-| `API_KEY_HMAC_SECRET` | No | Secreto para el HMAC-SHA256 de las claves de API. **Vacío = autenticación deshabilitada** (no se exige `X-API-Key`); fíjalo para forzar la validación (SPEC-005) |
+| `API_KEY_HMAC_SECRET` | No | Secreto para el HMAC-SHA256 de las claves de API. **Vacío = autenticación y permisos por lista deshabilitados** (no se exige `X-API-Key`); fíjalo para forzar la validación (SPEC-005/006) |
 | `API_KEY_DB_PATH` | No | Ruta del SQLite con las claves habilitadas (default: `data/api_keys.db`; debe estar en volumen persistente) |
 | `LOG_LEVEL` | No | `DEBUG` / `INFO` / `WARNING` / `ERROR` (default: `INFO`) |
 | `TENANT_TIMEZONE` | No | Zona horaria IANA del tenant para acotar periodos del upsert (default: `UTC`) |
@@ -360,7 +360,7 @@ Los nombres de campo deben ser los **nombres internos** de las columnas en Share
 
 | Cabecera | Dirección | Descripción |
 |---|---|---|
-| `X-API-Key` | Request | **Clave de autenticación del caller** (SPEC-005). Obligatoria en todos los `/v1/...` cuando la auth está habilitada; ausente/invalida/revocada → `401`. `/health` no la exige |
+| `X-API-Key` | Request | **Clave de autenticación del caller** (SPEC-005). Obligatoria en todos los `/v1/...` cuando la auth está habilitada; ausente/invalida/revocada → `401`; sin permiso sobre la lista → `403` (SPEC-006). `/health` no la exige |
 | `X-App-ID` | Request | Identificador informativo del caller — se registra en todos los logs (no verificado) |
 | `X-Request-ID` | Response | UUID de trazabilidad generado por el middleware |
 
@@ -378,12 +378,64 @@ python -m app.admin.api_keys_admin issue jdiaz
 ```
 
 Revocar, reactivar, borrar o consultar son sentencias SQL directas sobre el
-archivo (`python -m app.admin.api_keys_admin --help-sql` las lista). Rotar una
-clave = revocar la vieja + emitir una nueva.
+archivo (`python -m app.admin.api_keys_admin --help-sql` las lista). Para cambiar
+una clave conservando sus permisos usa `rotate` (ver más abajo).
 
-> Si `API_KEY_HMAC_SECRET` está vacío, la autenticación queda **deshabilitada**
-> (modo compatibilidad para el despliegue escalonado) y el servicio emite un
-> aviso al arrancar. Fíjalo para forzar la validación.
+> Si `API_KEY_HMAC_SECRET` está vacío, la autenticación **y los permisos por
+> lista** quedan **deshabilitados** (modo compatibilidad para el despliegue
+> escalonado) y el servicio emite un aviso al arrancar. Fíjalo para forzarlos.
+
+### Permisos por lista (SPEC-006)
+
+Desde la v2.8.0 cada clave solo puede operar sobre las listas y bibliotecas para
+las que tenga permisos concedidos. **Una clave sin permisos no accede a nada**
+(`403`). Por cada par (clave, lista) hay cuatro permisos: `read`, `create`,
+`update` y `delete` (`delete` se guarda, pero hoy ningún endpoint lo exige).
+
+| Endpoint | Permiso requerido |
+|---|---|
+| `GET /v1/graph/sites/{site_id}/lists/{list_id}/items` | `read` |
+| `POST /v1/graph/sites/{site_id}/lists/{list_id}/items` | `create` |
+| `GET /v1/graph/sites/{site_id}/drives/{drive_id}/items[/{item_id}[/download]]` | `read` |
+| `POST /v1/graph/sites/{site_id}/drives/{drive_id}/files` | `create` (+ `update` si el archivo ya existe) |
+| `POST /v1/sharepoint/list/item` | `create` |
+| `PATCH /v1/sharepoint/list/item` | `update` |
+| `POST /v1/sharepoint/list/item:upsert` | `create` **y** `update` |
+| `POST /v1/sharepoint/list/items:search` | `read` |
+| `POST /v1/sharepoint/upload` | `create` (+ `update` si el archivo ya existe) |
+| `GET /v1/graph/sites`, `/sites/{site_id}/lists`, `/sites/{site_id}/drives` | clave **administradora** (`is_admin = 1`) |
+
+- Los permisos se **conceden por URL** pero se **evalúan por IDs** (`site_id` +
+  `list_id`, o `drive_id` en bibliotecas): la misma regla cubre `/v1/sharepoint` y
+  `/v1/graph`, y cualquier variante de la URL de la lista da la misma decisión.
+- Una **biblioteca de documentos cuenta como lista**: el permiso cubre sus archivos.
+  No hay permisos por carpeta.
+- Ser **administrador** solo abre los endpoints de discovery; no da acceso a datos.
+- La denegación responde `403` con `detail.code = "permissionDenied"` y
+  `detail.required` (los permisos que faltan). El `403` de Graph conserva su propio
+  `detail.code` (`accessDenied`). Cada denegación queda en el log con `principal`,
+  `permission` y los IDs de la lista.
+
+Administración (dentro del contenedor: `docker exec sp-connector python -m app.admin.api_keys_admin ...`):
+
+```bash
+# Conceder (fija EXACTAMENTE los permisos indicados; sustituye los anteriores)
+python -m app.admin.api_keys_admin grant jdiaz "https://host/sitio/Lists/Clientes/AllItems.aspx" --read --update
+# Quitar todos los permisos sobre una lista
+python -m app.admin.api_keys_admin revoke jdiaz "https://host/sitio/Lists/Clientes/AllItems.aspx"
+# Ver los permisos de una clave
+python -m app.admin.api_keys_admin permissions jdiaz
+# Cambiar la clave conservando sus permisos (la anterior deja de valer al instante)
+python -m app.admin.api_keys_admin rotate jdiaz
+```
+
+Marcar una clave como administradora es SQL directo
+(`UPDATE api_keys SET is_admin = 1 WHERE principal = 'jdiaz';`, ver `--help-sql`).
+
+> **Al actualizar desde v2.7.0:** tras desplegar, todas las claves existentes
+> reciben `403` hasta que se les concedan permisos. Prepara los `grant` antes y
+> ejecútalos inmediatamente después del despliegue.
+
 
 ---
 

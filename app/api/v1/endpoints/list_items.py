@@ -3,6 +3,8 @@ import logging
 from fastapi import APIRouter, Depends, Query
 
 from app.core.dependencies import get_sp
+from app.core.permissions import Permission
+from app.core.security import require_list_permission
 from app.schemas.list_items import (
     CreateListItemRequest,
     CreateListItemResponse,
@@ -19,6 +21,7 @@ router = APIRouter(prefix="/graph", tags=["List Items"])
     "/sites/{site_id}/lists/{list_id}/items",
     response_model=ListItemsResponse,
     summary="Read items from a SharePoint list",
+    dependencies=[Depends(require_list_permission(Permission.READ))],
 )
 async def get_list_items(
     site_id: str,
@@ -34,6 +37,8 @@ async def get_list_items(
     """Fetches items from the specified SharePoint list along with their field values.
 
     Use the field names returned here as keys when inserting new items via POST.
+
+    Requires the `read` permission on the list; otherwise `403`.
 
     Obtain IDs from the discovery endpoints:
     - `GET /v1/graph/sites` → `site_id`
@@ -58,6 +63,7 @@ async def get_list_items(
     response_model=CreateListItemResponse,
     status_code=201,
     summary="Insert a new record into a SharePoint list",
+    dependencies=[Depends(require_list_permission(Permission.CREATE))],
 )
 async def create_list_item(
     site_id: str,
@@ -70,6 +76,8 @@ async def create_list_item(
     The `fields` object must use **internal field names** (not display names).
     Run `GET /v1/graph/sites/{site_id}/lists/{list_id}/items` first to inspect
     existing field names before inserting.
+
+    Requires the `create` permission on the list; otherwise `403`.
 
     **Graph API target:**
     ```

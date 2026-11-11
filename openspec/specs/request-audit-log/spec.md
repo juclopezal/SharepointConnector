@@ -2,9 +2,7 @@
 
 ## Purpose
 Registro de auditoría por petición que liga `principal`, método, ruta y `status_code`, incluidos los intentos rechazados, sin exponer nunca la clave (SPEC-005, v2.7.0).
-
 ## Requirements
-
 ### Requirement: Identidad en el registro de cada petición
 
 El registro estructurado de cada petición completada SHALL incluir el campo
@@ -43,3 +41,26 @@ recibido, en ninguna circunstancia (petición aceptada o rechazada).
 - **THEN** no aparece ninguna clave de API en claro
 - **AND** cada entrada puede correlacionarse con su petición mediante el
   `request_id` (devuelto también en la cabecera `X-Request-ID`)
+
+### Requirement: Registro de las denegaciones por permisos
+
+El servicio SHALL registrar cada petición denegada por autorización (`403`
+`permissionDenied`) con el `principal`, `path`, `status_code` 403, los permisos
+requeridos que faltaban (`permission`) y, cuando se conozcan, `site_id`, `list_id` o
+`drive_id` de la lista afectada. El campo `permission` SHALL añadirse a la whitelist de
+campos estructurados permitidos. La entrada NO SHALL contener la clave de API.
+
+#### Scenario: Denegación por falta de permiso
+
+- **WHEN** la clave `jdiaz` intenta un `PATCH /v1/sharepoint/list/item` sobre una lista
+  sin `can_update`
+- **THEN** se registra una entrada con `principal = "jdiaz"`, `status_code = 403`,
+  `permission = "update"` y el `site_id`/`list_id` de la lista
+- **AND** la entrada no contiene la clave recibida
+
+#### Scenario: Denegación de discovery
+
+- **WHEN** una clave no administradora llama a `GET /v1/graph/sites`
+- **THEN** se registra una entrada con su `principal`, `status_code = 403` y
+  `permission = "admin"`
+

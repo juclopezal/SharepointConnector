@@ -10,10 +10,14 @@ context: |
     usuario). El App Registration tiene permisos de aplicación Sites.Read.All y
     Sites.ReadWrite.All sobre todo el tenant. `TokenManager` cachea el token en
     memoria y lo renueva 60s antes de que expire.
-  Autenticación de los clientes del conector: NO EXISTE hoy. La cabecera `X-App-ID`
-    es informativa (solo se registra en los logs) y ni siquiera es obligatoria.
-    Todo cambio que toque la superficie pública debe tenerlo presente: el servicio
-    opera con permisos amplios sobre el tenant y no valida quién le llama.
+  Autenticación y autorización de los clientes del conector: cada petición a
+    `/v1/...` trae `X-API-Key`, validada por HMAC contra un SQLite (SPEC-005, 401 si
+    falla) y resuelta a un `principal`. Cada clave solo opera sobre las listas y
+    bibliotecas para las que tiene permisos (`read`/`create`/`update`/`delete`),
+    evaluados por `site_id` + `list_id`/`drive_id`; sin permiso → 403
+    `permissionDenied`; discovery exige `is_admin` (SPEC-006). Todo endpoint nuevo
+    debe declarar qué permiso exige. Sin `API_KEY_HMAC_SECRET` ambas capas están
+    deshabilitadas (modo compatibilidad). `X-App-ID` sigue siendo informativa.
 
   Superficie de la API — dos capas deliberadas:
   - `/v1/sharepoint` — orientada a persona: el caller pasa la URL de SharePoint tal
@@ -39,8 +43,9 @@ context: |
     incluidos los codificados (`_x006c_dq4`, `_x00da_ltima`) y los sintéticos de las
     columnas lookup (`{Columna}LookupId`).
 
-  Estado y concurrencia: proceso único, sin base de datos. Todo el estado es caché
-    en memoria: IDs de site (permanente — no cambian durante la vida del proceso) y
+  Estado y concurrencia: proceso único. Única persistencia: el SQLite de claves y
+    permisos (volumen `/app/data`, sin caché: se lee en cada petición). El resto del
+    estado es caché en memoria: IDs de site (permanente — no cambian durante la vida del proceso) y
     definiciones de columna por `(site_id, list_id)` con TTL de 300s (las columnas
     sí pueden añadirse o renombrarse). Los servicios son singletons vía `@lru_cache`
     en `app/core/dependencies.py`.

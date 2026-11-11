@@ -889,6 +889,29 @@ class SharePointService:
         )
         return result
 
+    async def drive_item_exists(
+        self, site_id: str, drive_id: str, folder: str, filename: str
+    ) -> bool:
+        """¿Existe ya ``folder/filename`` en el drive? (SPEC-006, autorización de subida).
+
+        Usa el mismo saneo y codificación de ruta que ``upload_file``, así que
+        comprueba exactamente el destino que se sobrescribiría. ``404`` → no existe.
+        """
+        remote_path = _encode_drive_path(folder, filename)
+        url = f"{GRAPH}/sites/{site_id}/drives/{drive_id}/root:/{remote_path}"
+        try:
+            await self._get(url)
+        except GraphAPIError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+        return True
+
+    async def get_drive_list_id(self, site_id: str, drive_id: str) -> str:
+        """``list_id`` de la lista que respalda una biblioteca (``GET .../drives/{id}/list``)."""
+        data = await self._get(f"{GRAPH}/sites/{site_id}/drives/{drive_id}/list?$select=id")
+        return data["id"]
+
     async def get_file_metadata(self, site_id: str, drive_id: str, item_id: str) -> dict:
         url = f"{GRAPH}/sites/{site_id}/drives/{drive_id}/items/{item_id}"
         result = await self._get(url)

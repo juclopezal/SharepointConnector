@@ -1,3 +1,51 @@
+## v2.8.0 — 2026-11-11
+
+### Feature: Permisos por clave de API a nivel de lista (SPEC-006)
+
+> ⚠️ **Requiere acción al desplegar (BREAKING para los consumidores actuales).**
+> Desde esta versión una clave **sin permisos no accede a nada**: tras actualizar
+> desde v2.7.0, **todas las claves existentes reciben `403`** en `/v1/...` hasta
+> que se les concedan permisos con `grant`. Prepara la lista clave → listas →
+> permisos antes de desplegar y ejecuta los `grant` inmediatamente después (local y
+> docker-ag). Las claves que usen discovery necesitan además `is_admin = 1`.
+> Se mantiene la versión menor por coherencia con v2.7.0, que introdujo la clave
+> obligatoria del mismo modo.
+
+**Contexto:** desde v2.7.0 el conector sabe **quién** llama, pero no limitaba **qué** podía hacer: cualquier clave válida alcanzaba todo lo que alcanza el App Registration (`Sites.ReadWrite.All` sobre todo el tenant). Los permisos de SharePoint no ayudan porque Graph ve una única identidad de aplicación.
+
+**Solución:**
+- **Cuatro permisos por clave y lista** (`read`, `create`, `update`, `delete`) en la tabla nueva `api_key_permissions` del mismo SQLite. Denegar por defecto → `403`.
+- **Declarados por URL, evaluados por IDs:** `grant` resuelve la URL una vez; las comprobaciones comparan `site_id` + `list_id` (o `drive_id` en bibliotecas). Una misma regla cubre `/v1/sharepoint` y `/v1/graph`, y las variantes de la URL no la esquivan.
+- **Bibliotecas = listas:** el permiso cubre sus archivos (subida, metadatos, descarga, navegación).
+- **Mapeo por endpoint:** lectura/búsqueda/descarga → `read`; crear → `create`; `PATCH` → `update`; `:upsert` → `create` **y** `update` (antes de buscar `match`); subida → `create`, y `update` si el archivo ya existe — Graph lo **sobrescribiría en silencio**, así que con solo `create` el conector comprueba antes si existe y deniega.
+- **Discovery** (`/graph/sites`, `/sites/{id}/lists`, `/sites/{id}/drives`) solo para claves con `is_admin = 1` (columna nueva en `api_keys`). Ser admin no da acceso a datos.
+- **`403` propio y distinguible:** `detail.code = "permissionDenied"` + `detail.required`; el `403` de Graph conserva su `accessDenied`.
+- **Auditoría:** cada denegación se registra ("Permission denied") con `principal`, `permission` y los IDs de la lista; campo `permission` añadido a `_EXTRA_FIELDS`.
+- **Administración:** `grant`, `revoke`, `permissions` y `rotate` (cambia la clave conservando permisos e historial; la anterior deja de valer al instante). `issue` ya no hereda permisos huérfanos. `--help-sql` documenta `is_admin`, permisos y el `PRAGMA foreign_keys` para borrar en cascada.
+- **Migración automática e idempotente** del SQLite de v2.7.0 al arrancar (añade `is_admin = 0` y la tabla de permisos, sin tocar las filas).
+- **Modo compatibilidad:** sin `API_KEY_HMAC_SECRET` no se comprueban ni claves ni permisos (como v2.7.0).
+
+**Archivos nuevos:**
+- `app/core/permissions.py` — `Permission`, `PermissionStore`, `Authorizer`, `AllowAllAuthorizer`
+- `tests/test_permissions.py`, `tests/test_permissions_endpoints.py`, `tests/test_api_keys_admin.py`
+- `requirements/SPEC-006_API_Key_List_Permissions.md`
+
+**Archivos modificados:**
+- `app/core/api_keys.py` — `ensure_schema` (migración), columna `is_admin`, `db_path`
+- `app/core/dependencies.py` — `get_authorizer`
+- `app/core/security.py` — `require_admin`, `require_list_permission`, `require_drive_permission`
+- `app/core/exceptions.py` — `PermissionDeniedError` + handler con auditoría
+- `app/core/logging.py` — `permission` en `_EXTRA_FIELDS`
+- `app/main.py` — registro del handler; aviso de arranque ampliado
+- `app/services/sharepoint.py` — `drive_item_exists`, `get_drive_list_id`
+- `app/api/v1/endpoints/discovery.py`, `list_items.py`, `files.py`, `sharepoint.py` — permiso requerido por endpoint
+- `app/admin/api_keys_admin.py` — `grant`, `revoke`, `permissions`, `rotate`
+- `tests/test_api_key_auth.py`, `tests/test_sharepoint_service.py`
+- `README.md`, `ARQUITECTURA.md`, `arquitecturasUML.md`, `TECNOLOGIAS.md`, `VERSION`, `openspec/config.yaml`
+- OpenSpec: cambio `add-api-key-list-permissions` archivado (capability nueva `list-permissions`; modifica `api-key-auth` y `request-audit-log`)
+
+---
+
 ## v2.7.0 — 2026-11-09
 
 ### Feature: Autenticación por clave de API y auditoría por identidad (SPEC-005)

@@ -13,8 +13,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from app.core.config import settings
-from app.core.dependencies import get_resolver, get_sp
+from app.core.dependencies import get_authorizer, get_resolver, get_sp
 from app.core.exceptions import GraphAPIError
+from app.core.permissions import Authorizer, Permission
+from app.core.security import require_principal
 from app.core.uploads import read_upload
 from app.schemas.sharepoint import (
     ExplicitPeriod,
@@ -67,6 +69,8 @@ async def create_list_item_by_url(
     payload: ListItemByUrlRequest,
     sp: SharePointService = Depends(get_sp),
     resolver: SharePointResolver = Depends(get_resolver),
+    principal: str = Depends(require_principal),
+    authz: Authorizer = Depends(get_authorizer),
 ):
     """Crea un ítem en la lista identificada por `sharepoint_url`.
 
@@ -75,9 +79,12 @@ async def create_list_item_by_url(
     columnas.
 
     Ejemplo de URL: `https://host.sharepoint.com/Oper/Lists/Incidencias/View.aspx`
+
+    Requiere el permiso `create` sobre la lista; si no → `403`.
     """
     logger.info("create_list_item_by_url → url=%r", payload.sharepoint_url)
     resolved = await resolver.resolve_list(payload.sharepoint_url)
+    authz.require_list(principal, resolved.site_id, resolved.list_id, Permission.CREATE)
     result = await sp.create_list_item(resolved.site_id, resolved.list_id, payload.data)
     return ListItemByUrlResponse(
         id=result["id"],
@@ -96,6 +103,8 @@ async def update_list_item_by_url(
     payload: ListItemUpdateByUrlRequest,
     sp: SharePointService = Depends(get_sp),
     resolver: SharePointResolver = Depends(get_resolver),
+    principal: str = Depends(require_principal),
+    authz: Authorizer = Depends(get_authorizer),
 ):
     """Actualiza un ítem de la lista identificada por `sharepoint_url`.
 
@@ -110,6 +119,7 @@ async def update_list_item_by_url(
     direccionar el ítem por él.
 
     Respuestas de error:
+    - `403` si la clave no tiene el permiso `update` sobre la lista.
     - `400` si `filter_by.field` es `ID` y `filter_by.value` no es numérico.
     - `404` si ningún registro coincide con `filter_by`.
     - `409` si coincide más de uno (el filtro no era único).
@@ -129,6 +139,7 @@ async def update_list_item_by_url(
         )
 
     resolved = await resolver.resolve_list(payload.sharepoint_url)
+    authz.require_list(principal, resolved.site_id, resolved.list_id, Permission.UPDATE)
     if by_id:
         matches = await _find_list_item_by_id(
             sp, resolved.site_id, resolved.list_id, int(payload.filter_by.value)
@@ -177,6 +188,8 @@ async def upsert_list_item_by_url(
     payload: UpsertListItemRequest,
     sp: SharePointService = Depends(get_sp),
     resolver: SharePointResolver = Depends(get_resolver),
+    principal: str = Depends(require_principal),
+    authz: Authorizer = Depends(get_authorizer),
 ):
     """Inserta o actualiza un ítem de la lista identificada por `sharepoint_url`.
 
@@ -197,6 +210,10 @@ async def upsert_list_item_by_url(
     - **≥1 coincidencia** → actualiza el **primer** registro y responde
       `result="updated"`. Si hay más de uno, se emite un `warning` en los logs
       (no es error); `matched` indica cuántos coincidieron.
+
+    Permisos: exige `create` **y** `update` sobre la lista antes de buscar
+    `match` — el desenlace depende del estado de la lista, así que la
+    autorización no puede depender de él. Si falta alguno → `403`.
     """
     match = payload.match
     logger.info(
@@ -209,6 +226,9 @@ async def upsert_list_item_by_url(
     )
 
     resolved = await resolver.resolve_list(payload.sharepoint_url)
+    authz.require_list(
+        principal, resolved.site_id, resolved.list_id, Permission.CREATE, Permission.UPDATE
+    )
 
     if isinstance(match.period, ExplicitPeriod):
         period_input: "str | tuple[str, str] | None" = (match.period.from_, match.period.to)
@@ -285,6 +305,8 @@ async def search_list_items_by_url(
     payload: ListItemsSearchByUrlRequest,
     sp: SharePointService = Depends(get_sp),
     resolver: SharePointResolver = Depends(get_resolver),
+    principal: str = Depends(require_principal),
+    authz: Authorizer = Depends(get_authorizer),
 ):
     """Busca ítems de la lista identificada por `sharepoint_url`.
 
@@ -353,6 +375,9 @@ async def search_list_items_by_url(
     `top` (1–5000, por defecto 100) acota el resultado siguiendo la paginación
     de Graph; `has_more` indica si quedaron filas coincidentes fuera del corte.
     0 coincidencias → `200` con `total: 0`.
+
+    Requiere el permiso `read` sobre la lista; si no → `403` (antes de validar
+    filtros contra el esquema).
     """
     logger.info(
         "search_list_items_by_url → url=%r filters=%d ops=%r order_by=%r top=%d",
@@ -365,6 +390,7 @@ async def search_list_items_by_url(
         payload.top,
     )
     resolved = await resolver.resolve_list(payload.sharepoint_url)
+    authz.require_list(principal, resolved.site_id, resolved.list_id, Permission.READ)
     filters = [(f.field, f.op, f.value) for f in (payload.filters or [])]
     order_by = (
         (payload.order_by.field, payload.order_by.direction)
@@ -406,6 +432,8 @@ async def upload_file_by_url(
     file: Annotated[UploadFile, File()],
     sp: SharePointService = Depends(get_sp),
     resolver: SharePointResolver = Depends(get_resolver),
+    principal: str = Depends(require_principal),
+    authz: Authorizer = Depends(get_authorizer),
 ):
     """Sube un archivo a la biblioteca/carpeta identificada por `sharepoint_url`.
 
@@ -415,17 +443,30 @@ async def upload_file_by_url(
 
     La URL puede ser la de la biblioteca (`.../Forms/AllItems.aspx`) o incluir el
     parámetro `?id=` con la ruta de una subcarpeta concreta.
+
+    Requiere el permiso `create` sobre la biblioteca y, si ya existe un archivo
+    con ese nombre en la carpeta destino, también `update` (Graph lo
+    reemplazaría en silencio). Si falta → `403` y no se escribe nada.
     """
     logger.info(
         "upload_file_by_url → url=%r filename=%r", sharepoint_url, file.filename
     )
     resolved = await resolver.resolve_upload_target(sharepoint_url)
+    filename = file.filename or "upload"
+    await authz.require_upload(
+        principal,
+        resolved.site_id,
+        resolved.drive_id,
+        lambda: sp.drive_item_exists(
+            resolved.site_id, resolved.drive_id, resolved.folder, filename
+        ),
+    )
     data = await read_upload(file)
     result = await sp.upload_file(
         site_id=resolved.site_id,
         drive_id=resolved.drive_id,
         folder=resolved.folder,
-        filename=file.filename or "upload",
+        filename=filename,
         data=data,
     )
     return UploadByUrlResponse(

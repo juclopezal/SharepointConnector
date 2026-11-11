@@ -5,10 +5,15 @@ usando un secreto de servidor (``Settings.api_key_hmac_secret``). La validación
 compara en tiempo constante y solo acepta filas ``active = 1``.
 
 La gestión del almacén NO se expone en la API:
-- **Alta** de claves → utilidad de administración (``app/admin/api_keys_admin.py``),
-  que es la única que necesita generar la clave aleatoria y su HMAC.
-- **Revocar / reactivar / borrar / consultar** → sentencias SQL directas sobre el
-  archivo (ver la utilidad para ejemplos). Rotar una clave = revocar + nueva alta.
+- **Alta, rotación y permisos de lista** (SPEC-006) → utilidad de administración
+  (``app/admin/api_keys_admin.py``): ``issue``, ``rotate``, ``grant``, ``revoke``,
+  ``permissions``. Son las operaciones que necesitan generar una clave y su HMAC o
+  resolver una URL de SharePoint a IDs de Graph.
+- **Revocar / reactivar / borrar / consultar / marcar admin** → sentencias SQL
+  directas sobre el archivo (``--help-sql`` las lista).
+
+El mismo archivo guarda la tabla de permisos de SPEC-006
+(``app/core/permissions.py``); ``ensure_schema`` crea y migra ambas.
 """
 
 import hashlib
@@ -17,7 +22,7 @@ import logging
 import secrets
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
+from app.core.permissions import PERMISSIONS_SCHEMA, connect
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +32,25 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash    TEXT NOT NULL UNIQUE,
     active      INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
-    last_used   TEXT
+    last_used   TEXT,
+    is_admin    INTEGER NOT NULL DEFAULT 0
 );
 """
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Crea/migra el esquema de forma idempotente (SPEC-005 + SPEC-006).
+
+    Un archivo de v2.7.0 no tiene ``api_keys.is_admin``: se añade con valor 0 sin
+    tocar las filas. SQLite no soporta ``ADD COLUMN IF NOT EXISTS``, de ahí la
+    consulta previa a ``PRAGMA table_info``.
+    """
+    conn.executescript(_SCHEMA)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(api_keys)")}
+    if "is_admin" not in columns:
+        conn.execute("ALTER TABLE api_keys ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        logger.info("Migrated api_keys: added column is_admin")
+    conn.executescript(PERMISSIONS_SCHEMA)
 
 
 def compute_hash(api_key: str, secret: str) -> str:
@@ -59,16 +80,17 @@ class ApiKeyStore:
         self._secret = hmac_secret
         self._ensure_schema()
 
+    @property
+    def db_path(self) -> str:
+        return self._db_path
+
     def _connect(self) -> sqlite3.Connection:
         # El directorio del archivo debe existir (volumen montado).
-        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return connect(self._db_path)
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
-            conn.executescript(_SCHEMA)
+            ensure_schema(conn)
 
     def resolve_principal(self, api_key: str) -> str | None:
         """Devuelve el ``principal`` de una clave válida y activa, o ``None``.

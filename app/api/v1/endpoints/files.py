@@ -5,7 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import Response
 
-from app.core.dependencies import get_sp
+from app.core.dependencies import get_authorizer, get_sp
+from app.core.permissions import Authorizer, Permission
+from app.core.security import require_drive_permission, require_principal
 from app.core.uploads import read_upload
 from app.schemas.files import FileMetadataResponse, UploadFileResponse
 from app.services.sharepoint import SharePointService
@@ -29,6 +31,8 @@ async def upload_file(
         description="Subfolder path, e.g. 'Areas/testing_empty/OnlyTest'",
     ),
     sp: SharePointService = Depends(get_sp),
+    principal: str = Depends(require_principal),
+    authz: Authorizer = Depends(get_authorizer),
 ):
     """Uploads a file to the specified document library in SharePoint.
 
@@ -42,14 +46,25 @@ async def upload_file(
     Obtain IDs from the discovery endpoints:
     - `GET /v1/graph/sites` → `site_id`
     - `GET /v1/graph/sites/{site_id}/drives` → `drive_id`
+
+    Requires the `create` permission on the library, plus `update` when a file
+    with the same name already exists in the target folder (Graph would replace
+    it silently); otherwise `403` and nothing is written.
     """
     logger.info("upload_file → folder=%r filename=%r", folder, file.filename)
+    filename = file.filename or "upload"
+    await authz.require_upload(
+        principal,
+        site_id,
+        drive_id,
+        lambda: sp.drive_item_exists(site_id, drive_id, folder, filename),
+    )
     data = await read_upload(file)
     result = await sp.upload_file(
         site_id=site_id,
         drive_id=drive_id,
         folder=folder,
-        filename=file.filename or "upload",
+        filename=filename,
         data=data,
     )
     return UploadFileResponse(
@@ -65,6 +80,7 @@ async def upload_file(
     "/sites/{site_id}/drives/{drive_id}/items/{item_id}",
     response_model=FileMetadataResponse,
     summary="Get metadata for a file or folder in SharePoint",
+    dependencies=[Depends(require_drive_permission(Permission.READ))],
 )
 async def get_file_metadata(
     site_id: str,
@@ -97,6 +113,7 @@ async def get_file_metadata(
     "/sites/{site_id}/drives/{drive_id}/items/{item_id}/download",
     summary="Download a file from SharePoint",
     response_class=Response,
+    dependencies=[Depends(require_drive_permission(Permission.READ))],
     responses={
         200: {
             "content": {"application/octet-stream": {}},

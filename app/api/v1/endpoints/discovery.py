@@ -3,6 +3,8 @@ import logging
 from fastapi import APIRouter, Depends, Query
 
 from app.core.dependencies import get_sp
+from app.core.permissions import Permission
+from app.core.security import require_admin, require_drive_permission
 from app.schemas.discovery import (
     DriveItemInfo,
     DriveInfo,
@@ -23,6 +25,7 @@ router = APIRouter(prefix="/graph", tags=["Discovery"])
     "/sites",
     response_model=SitesResponse,
     summary="List SharePoint sites accessible to this application",
+    dependencies=[Depends(require_admin())],
 )
 async def list_sites(
     search: str = Query(
@@ -32,6 +35,8 @@ async def list_sites(
     sp: SharePointService = Depends(get_sp),
 ):
     """Returns all SharePoint sites the application has access to.
+
+    Requires an **admin** API key (`is_admin`); otherwise `403`.
 
     Use the returned site **`id`** (format: `hostname,site-collection-id,site-id`)
     in subsequent calls to `/sites/{site_id}/lists` or `/sites/{site_id}/drives`.
@@ -54,12 +59,15 @@ async def list_sites(
     "/sites/{site_id}/lists",
     response_model=ListsResponse,
     summary="List all SharePoint lists in a site",
+    dependencies=[Depends(require_admin())],
 )
 async def list_site_lists(
     site_id: str,
     sp: SharePointService = Depends(get_sp),
 ):
     """Returns every list (including hidden system lists) in the given site.
+
+    Requires an **admin** API key (`is_admin`); otherwise `403`.
 
     Use the returned list **`id`** with:
     - `POST /v1/graph/sites/{site_id}/lists/{list_id}/items` — insert a record
@@ -83,12 +91,15 @@ async def list_site_lists(
     "/sites/{site_id}/drives",
     response_model=DrivesResponse,
     summary="List document libraries (drives) in a site",
+    dependencies=[Depends(require_admin())],
 )
 async def list_site_drives(
     site_id: str,
     sp: SharePointService = Depends(get_sp),
 ):
     """Returns all drives (document libraries) in the given site.
+
+    Requires an **admin** API key (`is_admin`); otherwise `403`.
 
     Use the returned drive **`id`** with:
     - `POST /v1/graph/sites/{site_id}/drives/{drive_id}/files` — upload a file
@@ -112,6 +123,7 @@ async def list_site_drives(
     "/sites/{site_id}/drives/{drive_id}/items",
     response_model=FolderContentsResponse,
     summary="Browse files and folders inside a drive",
+    dependencies=[Depends(require_drive_permission(Permission.READ))],
 )
 async def list_drive_items(
     site_id: str,
@@ -129,6 +141,8 @@ async def list_drive_items(
 
     Navigate the tree by using the `id` of any returned folder as `item_id`
     in the next call. Use `is_folder: true` items to find subfolders.
+
+    Requires the `read` permission on the library; otherwise `403`.
     """
     raw = await sp.list_folder_children(site_id, drive_id, item_id)
     items = [

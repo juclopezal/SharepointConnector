@@ -1,6 +1,6 @@
 # Arquitectura: SharePoint Connector
 
-**Versión:** 2.6.1  
+**Versión:** 2.8.0  
 **Fecha:** 2026-09-03  
 **Autor:** Juan Camilo López Alzate — Latinia  
 
@@ -123,12 +123,13 @@ graph TD
 | **Config** | `app/core/config.py` | Variables de entorno validadas con pydantic-settings |
 | **TokenManager** | `app/core/auth.py` | Obtención y caché del token OAuth2 (client_credentials) |
 | **Dependencies** | `app/core/dependencies.py` | Singletons inyectables via `lru_cache` (FastAPI DI) |
-| **Exceptions** | `app/core/exceptions.py` | `GraphAPIError`, `APIKeyError` y handlers de error para FastAPI |
+| **Exceptions** | `app/core/exceptions.py` | `GraphAPIError`, `APIKeyError`, `PermissionDeniedError` y handlers de error para FastAPI |
 | **Logging** | `app/core/logging.py` | `JSONFormatter` para logs estructurados en JSON |
 | **Context** | `app/core/context.py` | `ContextVar`s para `request_id`, `client_app_id` y `principal` |
-| **API Keys** | `app/core/api_keys.py` | Almacén SQLite de claves habilitadas (HMAC-SHA256) y validación (SPEC-005) |
-| **Security** | `app/core/security.py` | Dependencia `require_principal` que valida `X-API-Key` y resuelve el `principal` |
-| **Admin de claves** | `app/admin/api_keys_admin.py` | Utilidad CLI: alta de claves (`issue`) y ayuda SQL para revocar/consultar |
+| **API Keys** | `app/core/api_keys.py` | Almacén SQLite de claves habilitadas (HMAC-SHA256), validación y migración del esquema (SPEC-005/006) |
+| **Permissions** | `app/core/permissions.py` | Permisos por clave y lista (`api_key_permissions`), `Authorizer` y autorizador nulo del modo compatibilidad (SPEC-006) |
+| **Security** | `app/core/security.py` | Dependencia `require_principal` que valida `X-API-Key` y resuelve el `principal`; dependencias `require_admin`/`require_list_permission`/`require_drive_permission` para `/v1/graph` |
+| **Admin de claves** | `app/admin/api_keys_admin.py` | Utilidad CLI: `issue`, `rotate`, `grant`, `revoke`, `permissions` y ayuda SQL |
 | **Router v1** | `app/api/v1/router.py` | Agrupador de endpoints bajo prefijo `/v1`; aplica la autenticación por clave |
 | **Discovery** | `app/api/v1/endpoints/discovery.py` | Endpoints de exploración (sites, listas, drives, carpetas) |
 | **List Items** | `app/api/v1/endpoints/list_items.py` | Lectura y creación de ítems en listas |
@@ -597,7 +598,7 @@ Descarga el contenido binario del archivo.
 
 | Cabecera | Dirección | Descripción |
 |---|---|---|
-| `X-API-Key` | Request | Clave de autenticación del caller (SPEC-005); obligatoria en `/v1/...` con la auth habilitada |
+| `X-API-Key` | Request | Clave de autenticación del caller (SPEC-005); obligatoria en `/v1/...` con la auth habilitada. Sus permisos por lista (SPEC-006) deciden el `403` |
 | `X-App-ID` | Request | Identificador informativo del caller (no verificado). Se registra en todos los logs |
 | `X-Request-ID` | Response | UUID generado por el middleware para trazabilidad |
 
@@ -607,7 +608,7 @@ Descarga el contenido binario del archivo.
 |---|---|
 | `400` | Parámetro inválido o faltante |
 | `401` | `X-API-Key` ausente, inválida o revocada (SPEC-005); o fallo de autenticación con Microsoft Graph |
-| `403` | Permisos insuficientes (site sin grant, permisos Graph incorrectos) |
+| `403` | `detail.code = "permissionDenied"`: la clave no tiene el permiso requerido sobre la lista o no es administradora (SPEC-006; `detail.required` nombra lo que falta). Cualquier otro `detail` (p. ej. `accessDenied`): permisos de la aplicación en Graph insuficientes |
 | `404` | Recurso no encontrado en SharePoint (incluye `filter_by` sin coincidencias en `PATCH /v1/sharepoint/list/item`) |
 | `409` | Conflicto: `filter_by` coincide con más de un registro en `PATCH /v1/sharepoint/list/item` |
 | `429` | Rate limit de Microsoft Graph — reintentar más tarde |
@@ -632,6 +633,13 @@ sequenceDiagram
         Connector-->>Caller: 401 (sin llamar a Graph) + auditoría
     end
     Connector->>Connector: resuelve principal (para la auditoría)
+    opt /v1/sharepoint (por URL)
+        Connector->>Graph: resuelve la URL a site_id / list_id / drive_id
+    end
+    Connector->>Connector: ¿la clave tiene el permiso sobre esa lista? (SPEC-006)
+    alt sin permiso
+        Connector-->>Caller: 403 permissionDenied (sin operar en Graph) + auditoría
+    end
     Connector->>Connector: ¿token en caché válido?
     alt token expirado o no existe
         Connector->>AAD: POST /oauth2/v2.0/token<br/>grant_type=client_credentials
@@ -642,6 +650,37 @@ sequenceDiagram
     Graph-->>Connector: 200 / error
     Connector-->>Caller: respuesta + X-Request-ID
 ```
+
+### Permisos por clave y lista (SPEC-006)
+
+El App Registration entra en Graph con una única identidad de aplicación, así que
+los permisos de SharePoint no distinguen entre llamantes. El conector aplica su
+propia capa de autorización sobre el `principal` de cada clave:
+
+- **Modelo:** tabla `api_key_permissions` en el mismo SQLite que `api_keys`:
+  `(principal → api_keys ON DELETE CASCADE, site_id, list_id, drive_id NULL,
+  list_url, can_read, can_create, can_update, can_delete, granted_at)`, clave
+  primaria `(principal, site_id, list_id)` e índice `(principal, site_id,
+  drive_id)`. Columna `api_keys.is_admin`. La migración desde v2.7.0 es automática
+  e idempotente al arrancar.
+- **Denegar por defecto:** sin fila, o con el permiso a 0 → `403`.
+- **Declarado por URL, evaluado por IDs:** `grant` resuelve la URL una sola vez
+  (lista → `resolve_list`; biblioteca → `resolve_upload_target` + `GET
+  /drives/{id}/list`). Las comprobaciones comparan siempre el par completo
+  (`site_id` + `list_id`, o `site_id` + `drive_id`), nunca el texto de la URL.
+- **Punto de aplicación:** en `/v1/graph` son dependencias de FastAPI que leen los
+  path params y deniegan antes de llamar a Graph; en `/v1/sharepoint` el endpoint
+  llama al `Authorizer` justo después de resolver la URL y antes de validar
+  columnas o escribir.
+- **Subida:** Graph (`PUT .../content`) reemplaza en silencio un archivo existente.
+  Con `create` pero sin `update`, el conector consulta antes si el destino existe
+  y, si existe, deniega; con ambos no hay consulta extra.
+- **Upsert:** exige `create` y `update` antes de buscar `match`.
+- **Discovery:** solo `is_admin = 1`; ser admin no da acceso a datos.
+- **Sin caché:** cada comprobación es una consulta SQLite por clave primaria, así
+  que la revocación aplica en la petición siguiente.
+- **Modo compatibilidad:** sin `API_KEY_HMAC_SECRET`, `get_authorizer` devuelve un
+  autorizador nulo (`AllowAllAuthorizer`) y nada se deniega, como en v2.7.0.
 
 ### Modelo de permisos: `Sites.Read.All` / `Sites.ReadWrite.All`
 

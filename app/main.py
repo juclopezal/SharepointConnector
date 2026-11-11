@@ -7,11 +7,14 @@ from fastapi import FastAPI, Request
 from app.api.v1.router import router as v1_router
 from app.core.config import settings
 from app.core.context import client_app_id_var, request_id_var
+from app.core.dependencies import get_api_key_store
 from app.core.exceptions import (
     APIKeyError,
     GraphAPIError,
+    PermissionDeniedError,
     api_key_exception_handler,
     graph_api_exception_handler,
+    permission_denied_exception_handler,
     unhandled_exception_handler,
 )
 from app.core.logging import configure_logging
@@ -19,10 +22,16 @@ from app.core.logging import configure_logging
 configure_logging(settings.log_level, settings.log_dir, settings.log_file)
 logger = logging.getLogger(__name__)
 
-if not settings.api_key_hmac_secret:
+if settings.api_key_hmac_secret:
+    # Instancia el almacén al arrancar: crea/migra el esquema SQLite (SPEC-006:
+    # v2.7.0 → is_admin + api_key_permissions) y hace visible al inicio cualquier
+    # problema con el volumen, en vez de en la primera petición.
+    get_api_key_store()
+else:
     logger.warning(
-        "API key authentication is DISABLED (API_KEY_HMAC_SECRET not set) — "
-        "all /v1 requests are allowed through. Set the secret to enforce X-API-Key."
+        "API key authentication and list permissions are DISABLED "
+        "(API_KEY_HMAC_SECRET not set) — all /v1 requests are allowed through. "
+        "Set the secret to enforce X-API-Key and per-list permissions."
     )
 
 app = FastAPI(
@@ -38,6 +47,7 @@ app = FastAPI(
 # Exception handlers
 app.add_exception_handler(APIKeyError, api_key_exception_handler)
 app.add_exception_handler(GraphAPIError, graph_api_exception_handler)
+app.add_exception_handler(PermissionDeniedError, permission_denied_exception_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 
 

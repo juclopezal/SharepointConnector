@@ -65,6 +65,7 @@
 | API de integración | Microsoft Graph API | v1.0 |
 | Autenticación contra Graph | OAuth 2.0 Client Credentials | RFC 6749 |
 | Autenticación de callers | Clave de API (`X-API-Key`) + HMAC-SHA256 | SPEC-005 |
+| Autorización de callers | Permisos por clave y lista en SQLite (`sqlite3` de la stdlib) | SPEC-006 |
 | Almacén de claves | SQLite (`sqlite3`, stdlib) | — |
 | Contenerización | Docker + Docker Compose | — |
 

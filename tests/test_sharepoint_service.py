@@ -865,3 +865,53 @@ async def test_search_on_id_column_rejected_in_legacy_two_tuple_form(sp):
     with pytest.raises(GraphAPIError) as exc:
         await sp.search_list_items("SITE", "LIST", filters=[("ID", "1087")])
     assert exc.value.status_code == 400
+
+
+# ----------------------------------------------------------------------
+# drive_item_exists / get_drive_list_id — SPEC-006 (autorización de subida)
+# ----------------------------------------------------------------------
+
+
+async def test_drive_item_exists_uses_same_encoded_path_as_upload(sp):
+    seen = {}
+
+    async def fake_get(url, extra_headers=None):
+        seen["url"] = url
+        return {"id": "F"}
+
+    sp._get = fake_get
+    assert await sp.drive_item_exists("SITE", "DRIVE", "Areas/Mi Carpeta", "a b.txt") is True
+    assert seen["url"].endswith("/sites/SITE/drives/DRIVE/root:/Areas/Mi%20Carpeta/a%20b.txt")
+
+
+async def test_drive_item_exists_404_means_new_file(sp):
+    async def fake_get(url, extra_headers=None):
+        raise GraphAPIError(404, "Resource not found in SharePoint")
+
+    sp._get = fake_get
+    assert await sp.drive_item_exists("SITE", "DRIVE", "", "nuevo.txt") is False
+
+
+async def test_drive_item_exists_propagates_other_errors(sp):
+    async def fake_get(url, extra_headers=None):
+        raise GraphAPIError(429, "rate limit")
+
+    sp._get = fake_get
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.drive_item_exists("SITE", "DRIVE", "", "x.txt")
+    assert exc.value.status_code == 429
+
+
+async def test_drive_item_exists_rejects_path_traversal(sp):
+    with pytest.raises(GraphAPIError) as exc:
+        await sp.drive_item_exists("SITE", "DRIVE", "a/../b", "x.txt")
+    assert exc.value.status_code == 400
+
+
+async def test_get_drive_list_id(sp):
+    async def fake_get(url, extra_headers=None):
+        assert url.endswith("/sites/SITE/drives/DRIVE/list?$select=id")
+        return {"id": "LIBLIST"}
+
+    sp._get = fake_get
+    assert await sp.get_drive_list_id("SITE", "DRIVE") == "LIBLIST"

@@ -20,6 +20,7 @@ _EXTRA_FIELDS = frozenset({
     "file_name",
     "graph_url",
     "graph_status",
+    "permission",  # SPEC-006: permisos requeridos en una denegación 403
 })
 
 
